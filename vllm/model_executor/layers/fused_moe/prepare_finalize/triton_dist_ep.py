@@ -30,6 +30,10 @@ from triton_dist.function.nvidia.common import (
     init_triton_dist_ep_op,
     triton_dist_ep_op_initialized,
 )
+from triton_dist.utils import (
+    init_nvshmem_by_torch_process_group,
+    is_shmem_initialized,
+)
 from triton_dist.kernels.nvidia.group_gemm import (
     GROUP_GEMM_BLOCK_SIZE_M,
     build_block_row_idx_info_kernel,
@@ -90,6 +94,17 @@ class TritonDistEPState:
 
             ep_rank = ep_group.rank()
             ep_size = ep_group.size()
+
+            # Triton-distributed NVSHMEM tensors require the NVSHMEM runtime
+            # to be initialized against the EP process group first.
+            if not is_shmem_initialized():
+                logger.info(
+                    "[EP Rank %d/%d] Initializing NVSHMEM runtime for "
+                    "Triton-distributed EP.",
+                    ep_rank,
+                    ep_size,
+                )
+                init_nvshmem_by_torch_process_group(ep_group)
 
             if not self._is_runtime_initialized():
                 logger.info(
