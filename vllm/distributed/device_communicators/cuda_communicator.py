@@ -168,6 +168,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 from .all2all import FlashInferNVLinkOneSidedManager
 
                 self.all2all_manager = FlashInferNVLinkOneSidedManager(self.cpu_group)
+            elif self.all2all_backend == "triton_distributed":
+                # Triton-distributed monolithic MoE path performs EP routing,
+                # communication and expert GEMMs internally in fused kernels.
+                # We still attach a lightweight manager so EP communicator
+                # initialization succeeds and generic EP plumbing remains intact.
+                from .all2all import NaiveAll2AllManager
+
+                logger.info_once(
+                    "Using Triton-distributed monolithic EP path; "
+                    "communication is handled in fused kernels.",
+                    scope="global",
+                )
+                self.all2all_manager = NaiveAll2AllManager(
+                    self.cpu_group, tcp_store_group
+                )
             else:
                 raise ValueError(f"Unknown all2all backend: {self.all2all_backend}")
 
