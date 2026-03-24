@@ -349,4 +349,27 @@ def triton_dist_ep_forward(
         enable_profiler=profile_config["fwd_combine"],
     )
 
+    # The expected output shape is [num_tokens, hidden_size]. Some runtime
+    # configurations can return [num_tokens * top_k, hidden_size]. Normalize
+    # the latter back to token-major layout to keep vLLM downstream contracts.
+    expected_tokens = hidden_states.shape[0]
+    if combine_output.shape[0] != expected_tokens:
+        if combine_output.shape[0] == expected_tokens * top_k:
+            logger.warning_once(
+                "Triton-distributed combine output has token-replica shape "
+                "[%d, %d], folding back to [%d, %d] by top-k reduction.",
+                combine_output.shape[0],
+                combine_output.shape[1],
+                expected_tokens,
+                combine_output.shape[1],
+                scope="global",
+            )
+            combine_output = combine_output.view(expected_tokens, top_k, -1).sum(dim=1)
+        else:
+            raise RuntimeError(
+                "Unexpected Triton-distributed combine output shape "
+                f"{tuple(combine_output.shape)} for input tokens={expected_tokens}, "
+                f"top_k={top_k}."
+            )
+
     return combine_output
