@@ -35,6 +35,7 @@ class UnquantizedMoeBackend(Enum):
     FLASHINFER_CUTLASS = "FlashInfer CUTLASS"
     AITER = "ROCm AITER"
     TRITON = "TRITON"
+    TRITON_DISTRIBUTED = "Triton Distributed"
     CPU = "CPU"
     XPU = "XPU"
     TPU = "TPU"
@@ -46,6 +47,7 @@ class UnquantizedMoeBackend(Enum):
 # We will directly call the kernel for those backend
 UNSUPPORTED_BACKEND = [
     UnquantizedMoeBackend.FLASHINFER_TRTLLM,
+    UnquantizedMoeBackend.TRITON_DISTRIBUTED,
     UnquantizedMoeBackend.CPU,
     UnquantizedMoeBackend.TPU,
     UnquantizedMoeBackend.OOT,
@@ -80,6 +82,12 @@ def select_unquantized_moe_backend(
 
     def _make_log_backend(backend: UnquantizedMoeBackend):
         return f"Using {backend.value} backend for Unquantized MoE"
+
+    # Check if Triton-distributed backend is requested
+    if moe_config.moe_parallel_config.use_triton_dist_kernels:
+        backend = UnquantizedMoeBackend.TRITON_DISTRIBUTED
+        logger.info_once(_make_log_backend(backend), scope="local")
+        return backend
 
     activation_format = (
         mk.FusedMoEActivationFormat.BatchedExperts

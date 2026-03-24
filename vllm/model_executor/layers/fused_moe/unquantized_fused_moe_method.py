@@ -74,6 +74,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self._is_monolithic = (
             current_platform.is_cpu()
             or self.unquantized_backend == UnquantizedMoeBackend.FLASHINFER_TRTLLM
+            or self.unquantized_backend == UnquantizedMoeBackend.TRITON_DISTRIBUTED
         )
 
         if self.is_monolithic:
@@ -83,6 +84,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         """Select the monolithic implementation based on platform."""
         if current_platform.is_cpu():
             return self.forward_monolithic_cpu
+        elif (
+            self.unquantized_backend == UnquantizedMoeBackend.TRITON_DISTRIBUTED
+        ):
+            return self.forward_monolithic_triton_dist
         else:
             return self.forward_monolithic_cuda
 
@@ -108,7 +113,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self,
         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> FusedMoEPrepareAndFinalizeModular | None:
-        if self.unquantized_backend == UnquantizedMoeBackend.AITER:
+        if self.unquantized_backend in (
+            UnquantizedMoeBackend.AITER,
+            UnquantizedMoeBackend.TRITON_DISTRIBUTED,
+        ):
             return None
         else:
             return super().maybe_make_prepare_finalize(routing_tables)
@@ -336,6 +344,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             global_num_experts=layer.global_num_experts,
             expert_map=layer.expert_map,
             shared_experts_input=shared_experts_input,
+        )
+
+    def forward_monolithic_triton_dist(
+        self,
+        layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        from .prepare_finalize.triton_dist_ep import triton_dist_ep_forward
+
+        return triton_dist_ep_forward(
+            layer=layer,
+            hidden_states=x,
+            router_logits=router_logits,
         )
 
     def forward_monolithic_cuda(

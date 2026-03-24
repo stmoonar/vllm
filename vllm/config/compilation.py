@@ -1102,6 +1102,20 @@ class CompilationConfig:
             )
             self.cudagraph_mode = CUDAGraphMode.NONE
 
+        # Disable CUDA graphs for Triton-distributed since NVSHMEM-based
+        # mega-kernels are not compatible with CUDA Graphs
+        if (
+            all2all_backend == "triton_distributed"
+            and data_parallel_size > 1
+            and self.cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            logger.info(
+                "Triton-distributed: Disabling CUDA Graphs since "
+                "NVSHMEM-based mega-kernels are incompatible with "
+                "CUDA Graphs."
+            )
+            self.cudagraph_mode = CUDAGraphMode.NONE
+
     def set_splitting_ops_for_attn_fusion(self):
         assert self.pass_config.fuse_attn_quant
         assert self.cudagraph_mode is not None

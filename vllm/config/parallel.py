@@ -46,6 +46,7 @@ All2AllBackend = Literal[
     "flashinfer_all2allv",  # temporary alias for flashinfer_nvlink_two_sided
     "flashinfer_nvlink_two_sided",
     "flashinfer_nvlink_one_sided",
+    "triton_distributed",
 ]
 
 
@@ -348,6 +349,23 @@ class ParallelConfig:
             )
             self.all2all_backend = "allgather_reducescatter"
 
+        if self.all2all_backend == "triton_distributed":
+            if not self.enable_expert_parallel:
+                raise ValueError(
+                    "triton_distributed all2all backend requires "
+                    "--enable-expert-parallel"
+                )
+            # Triton-distributed currently only supports intra-node
+            # EP via NVLink (max 8 GPUs)
+            ep_size = self.world_size // max(self.tensor_parallel_size, 1)
+            if ep_size > 8:
+                raise ValueError(
+                    f"triton_distributed all2all backend currently only "
+                    f"supports intra-node EP (<=8 GPUs), but got "
+                    f"ep_size={ep_size}. Consider using "
+                    f"deepep_high_throughput for multi-node EP."
+                )
+
         if self.data_parallel_size_local > self.data_parallel_size:
             raise ValueError(
                 f"data_parallel_size_local ({self.data_parallel_size_local}) "
@@ -535,6 +553,7 @@ class ParallelConfig:
                 "deepep_low_latency",
                 "mori",
                 "nixl_ep",
+                "triton_distributed",
             )
             and self.enable_expert_parallel
             and self.tensor_parallel_size > 1

@@ -461,3 +461,8 @@ def has_aiter() -> bool:
 def has_mori() -> bool:
     """Whether the optional `mori` package is available."""
     return _has_module("mori")
+
+
+def has_triton_dist() -> bool:
+    """Whether the optional `triton_dist` package is available."""
+    return _has_module("triton_dist")
