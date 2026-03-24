@@ -15,6 +15,7 @@ Key APIs:
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING
 
 import torch
@@ -56,6 +57,20 @@ class TritonDistEPState:
     def __init__(self):
         self._initialized = False
         self._ep_ctx: TritonDistEpContext | None = None
+        self._init_lock = threading.Lock()
+
+    def _is_runtime_initialized(self) -> bool:
+        return triton_dist_ep_op_initialized(ep_implementation="mega")
+
+    def invalidate(self) -> None:
+        """Invalidate local initialization state.
+
+        This is used as a recovery path when runtime reports NVSHMEM is not
+        initialized even though this helper believes it is initialized.
+        """
+        with self._init_lock:
+            self._initialized = False
+            self._ep_ctx = None
 
     def ensure_initialized(
         self,
@@ -67,42 +82,45 @@ class TritonDistEPState:
         num_sm: int = 64,
         capacity: float = 4.0,
     ) -> None:
-        if self._initialized:
-            return
+        with self._init_lock:
+            # Guard against stale local state: only short-circuit when both
+            # local state and Triton-dist runtime state are initialized.
+            if self._initialized and self._is_runtime_initialized():
+                return
 
-        ep_rank = ep_group.rank()
-        ep_size = ep_group.size()
+            ep_rank = ep_group.rank()
+            ep_size = ep_group.size()
 
-        if not triton_dist_ep_op_initialized(ep_implementation="mega"):
-            logger.info(
-                "[EP Rank %d/%d] Initializing Triton-distributed EP "
-                "with max_tokens=%d, hidden=%d, topk=%d, "
-                "num_experts=%d, num_sm=%d, capacity=%.1f",
-                ep_rank,
-                ep_size,
-                max_tokens_per_rank,
-                hidden_size,
-                top_k,
-                num_experts,
-                num_sm,
-                capacity,
-            )
-            init_triton_dist_ep_op(
-                ep_group=ep_group,
-                max_tokens_per_rank=max_tokens_per_rank,
-                hidden_size=hidden_size,
-                topk=top_k,
-                ep_rank=ep_rank,
-                num_experts=num_experts,
-                ep_size=ep_size,
-                dtype=torch.bfloat16,
-                weight_dtype=torch.float32,
-                num_sm=num_sm,
-                num_buffers=1,
-                capacity=capacity,
-            )
+            if not self._is_runtime_initialized():
+                logger.info(
+                    "[EP Rank %d/%d] Initializing Triton-distributed EP "
+                    "with max_tokens=%d, hidden=%d, topk=%d, "
+                    "num_experts=%d, num_sm=%d, capacity=%.1f",
+                    ep_rank,
+                    ep_size,
+                    max_tokens_per_rank,
+                    hidden_size,
+                    top_k,
+                    num_experts,
+                    num_sm,
+                    capacity,
+                )
+                init_triton_dist_ep_op(
+                    ep_group=ep_group,
+                    max_tokens_per_rank=max_tokens_per_rank,
+                    hidden_size=hidden_size,
+                    topk=top_k,
+                    ep_rank=ep_rank,
+                    num_experts=num_experts,
+                    ep_size=ep_size,
+                    dtype=torch.bfloat16,
+                    weight_dtype=torch.float32,
+                    num_sm=num_sm,
+                    num_buffers=1,
+                    capacity=capacity,
+                )
 
-        self._initialized = True
+            self._initialized = True
 
     def get_context(
         self,
@@ -153,22 +171,40 @@ def triton_dist_ep_forward(
     num_experts_per_rank = num_experts // ep_size
     hidden_size = hidden_states.shape[-1]
 
-    # Ensure NVSHMEM and EpAll2AllFusedOp are initialized
+    # Ensure NVSHMEM and EpAll2AllFusedOp are initialized.
+    # If runtime reports NVSHMEM is not initialized, invalidate local state and
+    # retry exactly once.
     max_tokens_per_rank = layer.moe_config.max_num_tokens
-    _triton_dist_state.ensure_initialized(
-        ep_group=ep_group,
-        max_tokens_per_rank=max_tokens_per_rank,
-        hidden_size=hidden_size,
-        top_k=top_k,
-        num_experts=num_experts,
-    )
+    retry_once = True
+    while True:
+        try:
+            _triton_dist_state.ensure_initialized(
+                ep_group=ep_group,
+                max_tokens_per_rank=max_tokens_per_rank,
+                hidden_size=hidden_size,
+                top_k=top_k,
+                num_experts=num_experts,
+            )
 
-    # Get context for this forward pass
-    ctx = _triton_dist_state.get_context(
-        ep_group=ep_group,
-        top_k=top_k,
-        num_experts=num_experts,
-    )
+            # Get context for this forward pass
+            ctx = _triton_dist_state.get_context(
+                ep_group=ep_group,
+                top_k=top_k,
+                num_experts=num_experts,
+            )
+            break
+        except Exception as e:
+            msg = str(e)
+            if retry_once and "NVSHMEM Library is not initialized" in msg:
+                logger.warning(
+                    "Triton-distributed runtime reported uninitialized NVSHMEM. "
+                    "Retrying initialization once."
+                )
+                _triton_dist_state.invalidate()
+                retry_once = False
+                continue
+            raise
+
     ep_op = ctx.ep_op
 
     # --- Step 1: Routing ---
