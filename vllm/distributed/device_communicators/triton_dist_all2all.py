@@ -103,8 +103,15 @@ class TritonDistAll2AllManager(All2AllManagerBase):
 
     def _ensure_rs_ctx(self, total_tokens: int, hidden: int):
         """Lazily create ReduceScatter context sized for the workload."""
-        if torch.cuda.current_device() != self.device.index:
-            torch.cuda.set_device(self.device)
+        ep_group = get_ep_group()
+        target_device = getattr(ep_group, "device", None)
+        if (
+            isinstance(target_device, torch.device)
+            and target_device.type == "cuda"
+            and target_device.index is not None
+            and torch.cuda.current_device() != target_device.index
+        ):
+            torch.cuda.set_device(target_device)
 
         # Pad to multiple of world_size (RS requirement)
         padded = math.ceil(total_tokens / self.world_size) * self.world_size
