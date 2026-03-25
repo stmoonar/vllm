@@ -183,6 +183,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 self.all2all_manager = NaiveAll2AllManager(
                     self.cpu_group, tcp_store_group
                 )
+            elif self.all2all_backend == "triton_distributed_ag_rs":
+                from .triton_dist_all2all import TritonDistAll2AllManager
+
+                self.all2all_manager = TritonDistAll2AllManager(
+                    self.cpu_group, tcp_store_group
+                )
             else:
                 raise ValueError(f"Unknown all2all backend: {self.all2all_backend}")
 

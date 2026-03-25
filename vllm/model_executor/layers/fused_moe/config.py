@@ -978,7 +978,8 @@ class FusedMoEParallelConfig:
     def use_ag_rs_all2all_kernels(self):
         return (
             self.use_all2all_kernels
-            and self.all2all_backend == "allgather_reducescatter"
+            and self.all2all_backend
+            in ("allgather_reducescatter", "triton_distributed_ag_rs")
         )
 
     @property
@@ -994,6 +995,13 @@ class FusedMoEParallelConfig:
         return (
             self.use_all2all_kernels
             and self.all2all_backend == "triton_distributed"
+        )
+
+    @property
+    def use_triton_dist_ag_rs_kernels(self):
+        return (
+            self.use_all2all_kernels
+            and self.all2all_backend == "triton_distributed_ag_rs"
         )
 
     @staticmethod

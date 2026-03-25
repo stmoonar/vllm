@@ -1107,7 +1107,7 @@ class CompilationConfig:
         # (CUDAGraphMode.NONE), use PIECEWISE mode and add the MoE custom
         # ops as splitting ops so attention/MLP layers are still captured.
         if (
-            all2all_backend == "triton_distributed"
+            all2all_backend in ("triton_distributed", "triton_distributed_ag_rs")
             and data_parallel_size > 1
         ):
             if self.cudagraph_mode not in (
