@@ -40,6 +40,7 @@ from triton_dist.kernels.nvidia.group_gemm import (
 )
 from triton_dist.kernels.nvidia.swiglu import swiglu_forward
 
+from vllm.config import get_current_vllm_config
 from vllm.distributed import get_ep_group
 from vllm.logger import init_logger
 
@@ -189,7 +190,15 @@ def triton_dist_ep_forward(
     # Ensure NVSHMEM and EpAll2AllFusedOp are initialized.
     # If runtime reports NVSHMEM is not initialized, invalidate local state and
     # retry exactly once.
-    max_tokens_per_rank = layer.moe_config.max_num_tokens
+    #
+    # CRITICAL: max_tokens_per_rank must be the scheduler's max_num_batched_tokens,
+    # NOT moe_config.max_num_tokens (which is the DP chunk size, default 256).
+    # EpAll2AllFusedOp allocates NVSHMEM buffers sized [nnodes, max_tokens, topk]
+    # at init time. If the actual batch exceeds this, preprocess() will crash with
+    # a tensor shape mismatch.
+    max_tokens_per_rank = (
+        get_current_vllm_config().scheduler_config.max_num_batched_tokens
+    )
     retry_once = True
     while True:
         try:
@@ -223,13 +232,22 @@ def triton_dist_ep_forward(
     ep_op = ctx.ep_op
 
     # --- Step 1: Routing ---
+    # Currently supports standard TopK routing only.
+    # GroupedTopK or custom routing functions are not yet supported.
+    if layer.use_grouped_topk:
+        raise NotImplementedError(
+            "Triton-distributed EP backend does not yet support "
+            "GroupedTopK routing. Use a different --all2all-backend."
+        )
+
     routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
     routing_weights, selected_experts = torch.topk(
         routing_weights, top_k, dim=-1
     )
-    routing_weights = routing_weights / routing_weights.sum(
-        dim=-1, keepdim=True
-    )
+    if layer.renormalize:
+        routing_weights = routing_weights / routing_weights.sum(
+            dim=-1, keepdim=True
+        )
     selected_experts = selected_experts.to(torch.int32)
 
     # --- Step 2: Compute local scatter indices for A2A layout ---
