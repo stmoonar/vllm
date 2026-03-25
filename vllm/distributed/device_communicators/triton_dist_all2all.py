@@ -3,14 +3,15 @@
 """
 Triton-distributed AllGather/ReduceScatter All2All manager for DP+EP.
 
-Replaces NCCL-based AllGatherv/ReduceScatterv with Triton-distributed's
-NVSHMEM-based implementations. Fits into vLLM's modular prepare/finalize
-framework — expert computation still uses vLLM's standard Triton/CUTLASS
-kernels.
+Dispatch (AllGather): uses NCCL via vLLM's existing all_gatherv infrastructure.
+Combine (ReduceScatter): uses Triton-distributed's NVSHMEM-based
+reduce_scatter_2d_op which overlaps reduction with NVSHMEM communication.
 
-Key difference from the monolithic triton_distributed backend:
-- Monolithic: fuses comm + GEMM in one mega-kernel (NVSHMEM + Group GEMM)
-- This AG/RS: only replaces the communication, expert compute is standard
+This hybrid approach is intentional:
+- AllGather carries routing metadata (small), NCCL handles it well and is
+  CUDA-graph compatible.
+- ReduceScatter carries expert output (large), NVSHMEM's overlap of
+  reduction + scatter across streams provides the real performance gain.
 
 Usage: --all2all-backend triton_distributed_ag_rs
 """
@@ -28,11 +29,9 @@ from triton_dist.kernels.nvidia.reduce_scatter import (
     reduce_scatter_2d_op,
 )
 from triton_dist.utils import (
-    NVSHMEM_SIGNAL_DTYPE,
     init_nvshmem_by_torch_process_group,
     is_shmem_initialized,
     nvshmem_barrier_all_on_stream,
-    nvshmem_create_tensor,
 )
 
 from vllm.distributed import get_dp_group, get_ep_group
@@ -46,76 +45,57 @@ logger = init_logger(__name__)
 
 class TritonDistAll2AllManager(All2AllManagerBase):
     """
-    AllGather/ReduceScatter for DP+EP using Triton-distributed NVSHMEM.
+    Hybrid AG(NCCL) + RS(NVSHMEM) manager for DP+EP.
 
-    Dispatch (AllGather): copies local tokens into a pre-allocated NVSHMEM
-    symmetric buffer, then each rank reads the full gathered tensor.
-
-    Combine (ReduceScatter): uses Triton-distributed's optimized
-    reduce_scatter_2d_op which overlaps reduction with NVSHMEM communication.
+    Dispatch uses NCCL AllGatherv (reliable, well-tested).
+    Combine uses Triton-distributed ReduceScatter (NVSHMEM, overlapped).
     """
 
     def __init__(self, cpu_group, tcp_store_group=None):
         super().__init__(cpu_group, tcp_store_group)
 
-        self._initialized = False
-        # Will be set during lazy init
-        self._ag_symm_buf: torch.Tensor | None = None  # [max_total_tokens, max_hidden]
-        self._ag_signal: torch.Tensor | None = None
+        self._rs_initialized = False
         self._rs_ctx: ReduceScatter2DContext | None = None
-        self._max_total_tokens: int = 0
-        self._max_hidden: int = 0
+        self._rs_max_M: int = 0
+        self._rs_N: int = 0
 
     def _ensure_nvshmem(self):
         """Ensure NVSHMEM runtime is initialized."""
         if not is_shmem_initialized():
-            # Use the EP group's underlying process group for NVSHMEM init
             ep_group = get_ep_group()
             logger.info(
-                "[Rank %d/%d] Initializing NVSHMEM for Triton-dist AG/RS.",
+                "[Rank %d/%d] Initializing NVSHMEM for Triton-dist RS.",
                 self.rank,
                 self.world_size,
             )
             init_nvshmem_by_torch_process_group(ep_group.device_group)
 
-    def _ensure_buffers(self, total_tokens: int, hidden: int):
-        """Lazily allocate NVSHMEM symmetric buffers sized for the workload."""
+    def _ensure_rs_ctx(self, total_tokens: int, hidden: int):
+        """Lazily create ReduceScatter context sized for the workload."""
+        # Pad to multiple of world_size (RS requirement)
+        padded = math.ceil(total_tokens / self.world_size) * self.world_size
+
         if (
-            self._initialized
-            and total_tokens <= self._max_total_tokens
-            and hidden <= self._max_hidden
+            self._rs_initialized
+            and padded <= self._rs_max_M
+            and hidden <= self._rs_N
         ):
             return
 
         self._ensure_nvshmem()
 
-        # Round total_tokens up to multiple of world_size (RS requirement)
-        total_tokens_padded = (
-            math.ceil(total_tokens / self.world_size) * self.world_size
-        )
-
         logger.info(
-            "[Rank %d] Allocating Triton-dist AG/RS buffers: "
-            "total_tokens=%d (padded=%d), hidden=%d",
+            "[Rank %d] Creating Triton-dist ReduceScatter context: "
+            "M=%d (padded=%d), N=%d",
             self.rank,
             total_tokens,
-            total_tokens_padded,
+            padded,
             hidden,
         )
 
-        # AllGather buffer: each rank writes its chunk, all ranks read full
-        self._ag_symm_buf = nvshmem_create_tensor(
-            (total_tokens_padded, hidden), torch.bfloat16
-        )
-        # Signal buffer for AG synchronization
-        self._ag_signal = nvshmem_create_tensor(
-            (self.world_size,), NVSHMEM_SIGNAL_DTYPE
-        )
-
-        # ReduceScatter context
-        local_world_size = min(self.world_size, 8)  # intra-node
+        local_world_size = min(self.world_size, 8)
         self._rs_ctx = create_reduce_scater_2d_ctx(
-            max_M=total_tokens_padded,
+            max_M=padded,
             N=hidden,
             rank=self.rank,
             world_size=self.world_size,
@@ -125,63 +105,17 @@ class TritonDistAll2AllManager(All2AllManagerBase):
 
         nvshmem_barrier_all_on_stream(torch.cuda.current_stream())
 
-        self._max_total_tokens = total_tokens_padded
-        self._max_hidden = hidden
-        self._initialized = True
+        self._rs_max_M = padded
+        self._rs_N = hidden
+        self._rs_initialized = True
 
         if not hasattr(self, "_atexit_registered"):
             atexit.register(self.destroy)
             self._atexit_registered = True
 
-    def _allgather_nvshmem(
-        self, tensors: list[torch.Tensor], sizes: list[int]
-    ) -> list[torch.Tensor]:
-        """AllGather tensors along dim=0 using NVSHMEM symmetric memory.
-
-        Each rank copies its local data into the symmetric buffer at its
-        designated offset, signals completion, then all ranks wait and
-        read the full buffer.
-        """
-        total_tokens = sum(sizes)
-        hidden = tensors[0].shape[1] if tensors[0].dim() > 1 else 1
-
-        # Compute the max hidden across all tensors for buffer sizing
-        max_hidden = max(t.shape[1] if t.dim() > 1 else 1 for t in tensors)
-        self._ensure_buffers(total_tokens, max_hidden)
-
-        # Compute this rank's offset in the gathered tensor
-        dist_group = get_ep_group()
-        my_rank = dist_group.rank_in_group
-        offset = sum(sizes[:my_rank])
-
-        results = []
-        for tensor in tensors:
-            t_hidden = tensor.shape[1] if tensor.dim() > 1 else 1
-
-            # Use NVSHMEM symmetric buffer for allgather
-            buf = self._ag_symm_buf[:total_tokens, :t_hidden]
-
-            # Reset signal
-            self._ag_signal.zero_()
-            nvshmem_barrier_all_on_stream(torch.cuda.current_stream())
-
-            # Copy local data to our slot in the symmetric buffer
-            buf[offset : offset + sizes[my_rank]].copy_(tensor)
-
-            # Signal that our data is ready
-            from triton_dist.kernels.nvidia.common_ops import _set_signal_cuda
-            _set_signal_cuda(
-                self._ag_signal[my_rank], 1, torch.cuda.current_stream()
-            )
-
-            # Wait for all ranks
-            nvshmem_barrier_all_on_stream(torch.cuda.current_stream())
-
-            # Read the full gathered tensor
-            gathered = buf[:total_tokens].clone()
-            results.append(gathered)
-
-        return results
+    # ------------------------------------------------------------------
+    # Dispatch: NCCL AllGatherv (delegates to vLLM's existing infra)
+    # ------------------------------------------------------------------
 
     def dispatch_router_logits(
         self,
@@ -201,7 +135,7 @@ class TritonDistAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
-        gathered = self._allgather_nvshmem(tensors_to_gather, sizes)
+        gathered = dist_group.all_gatherv(tensors_to_gather, dim=0, sizes=sizes)
 
         if extra_tensors is not None:
             return gathered[0], gathered[1], gathered[2:]
@@ -226,11 +160,15 @@ class TritonDistAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
-        gathered = self._allgather_nvshmem(tensors_to_gather, sizes)
+        gathered = dist_group.all_gatherv(tensors_to_gather, dim=0, sizes=sizes)
 
         if extra_tensors is None:
             return gathered[0], gathered[1], gathered[2]
         return gathered[0], gathered[1], gathered[2], gathered[3:]
+
+    # ------------------------------------------------------------------
+    # Combine: Triton-distributed NVSHMEM ReduceScatter
+    # ------------------------------------------------------------------
 
     def combine(
         self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
@@ -243,37 +181,26 @@ class TritonDistAll2AllManager(All2AllManagerBase):
         total_tokens = hidden_states.shape[0]
         hidden = hidden_states.shape[1]
 
-        # ReduceScatter requires M % world_size == 0; pad if needed
+        # RS requires M % world_size == 0; pad if needed
         padded_tokens = (
             math.ceil(total_tokens / self.world_size) * self.world_size
         )
 
+        self._ensure_rs_ctx(padded_tokens, hidden)
+
         if padded_tokens != total_tokens:
-            pad_size = padded_tokens - total_tokens
             hidden_states = torch.nn.functional.pad(
-                hidden_states, (0, 0, 0, pad_size)
+                hidden_states, (0, 0, 0, padded_tokens - total_tokens)
             )
 
-        self._ensure_buffers(padded_tokens, hidden)
-
-        # Use Triton-distributed reduce_scatter
         output = reduce_scatter_2d_op(hidden_states, self._rs_ctx)
 
-        # Output is [padded_tokens // world_size, hidden]
-        # Trim to our actual size
+        # output shape: [padded_tokens // world_size, hidden]
+        # Trim to this rank's actual token count
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
         my_size = sizes[dist_group.rank_in_group]
         return output[:my_size]
 
     def destroy(self):
-        if self._rs_ctx is not None:
-            try:
-                from triton_dist.utils import nvshmem_free_tensor_sync
-                if self._ag_symm_buf is not None:
-                    nvshmem_free_tensor_sync(self._ag_symm_buf)
-                if self._ag_signal is not None:
-                    nvshmem_free_tensor_sync(self._ag_signal)
-                self._rs_ctx = None
-            except Exception:
-                pass
-        self._initialized = False
+        self._rs_ctx = None
+        self._rs_initialized = False
