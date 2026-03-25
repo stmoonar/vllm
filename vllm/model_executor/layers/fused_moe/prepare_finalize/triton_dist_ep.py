@@ -15,6 +15,7 @@ Key APIs:
 
 from __future__ import annotations
 
+import atexit
 import threading
 from typing import TYPE_CHECKING
 
@@ -24,6 +25,7 @@ import triton
 
 from triton_dist.function.nvidia.common import (
     TritonDistEpContext,
+    deinit_triton_dist_ep_op,
     get_moe_optim_config,
     get_triton_dist_moe_profile_enabled,
     init_triton_dist_ep_ctx,
@@ -31,6 +33,7 @@ from triton_dist.function.nvidia.common import (
     triton_dist_ep_op_initialized,
 )
 from triton_dist.utils import (
+    finalize_distributed,
     init_nvshmem_by_torch_process_group,
     is_shmem_initialized,
 )
@@ -62,9 +65,31 @@ class TritonDistEPState:
         self._initialized = False
         self._ep_ctx: TritonDistEpContext | None = None
         self._init_lock = threading.Lock()
+        self._atexit_registered = False
 
     def _is_runtime_initialized(self) -> bool:
         return triton_dist_ep_op_initialized(ep_implementation="mega")
+
+    def shutdown(self) -> None:
+        """Release NVSHMEM resources gracefully.
+
+        Called via atexit or explicitly before process exit to prevent
+        implicit buffer free errors from NVSHMEM's weakref finalizers.
+        """
+        with self._init_lock:
+            if not self._initialized:
+                return
+            try:
+                deinit_triton_dist_ep_op(ep_implementation="mega")
+            except Exception:
+                pass
+            try:
+                if is_shmem_initialized():
+                    finalize_distributed()
+            except Exception:
+                pass
+            self._initialized = False
+            self._ep_ctx = None
 
     def invalidate(self) -> None:
         """Invalidate local initialization state.
@@ -136,6 +161,13 @@ class TritonDistEPState:
                 )
 
             self._initialized = True
+
+            # Register atexit handler so NVSHMEM buffers are freed
+            # before Python's weakref finalizers run (which would
+            # trigger NvshmemError on implicit free).
+            if not self._atexit_registered:
+                atexit.register(self.shutdown)
+                self._atexit_registered = True
 
     def get_context(
         self,
