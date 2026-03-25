@@ -1102,19 +1102,33 @@ class CompilationConfig:
             )
             self.cudagraph_mode = CUDAGraphMode.NONE
 
-        # Disable CUDA graphs for Triton-distributed since NVSHMEM-based
-        # mega-kernels are not compatible with CUDA Graphs
+        # Triton-distributed mega-kernels use NVSHMEM which cannot be
+        # captured inside CUDA Graphs.  Instead of disabling CG entirely
+        # (CUDAGraphMode.NONE), use PIECEWISE mode and add the MoE custom
+        # ops as splitting ops so attention/MLP layers are still captured.
         if (
             all2all_backend == "triton_distributed"
             and data_parallel_size > 1
-            and self.cudagraph_mode != CUDAGraphMode.NONE
         ):
-            logger.info(
-                "Triton-distributed: Disabling CUDA Graphs since "
-                "NVSHMEM-based mega-kernels are incompatible with "
-                "CUDA Graphs."
-            )
-            self.cudagraph_mode = CUDAGraphMode.NONE
+            if self.cudagraph_mode not in (
+                CUDAGraphMode.NONE,
+                CUDAGraphMode.PIECEWISE,
+            ):
+                logger.info(
+                    "Triton-distributed: Switching to PIECEWISE CUDA Graphs. "
+                    "MoE layers (NVSHMEM) are excluded; attention/MLP layers "
+                    "remain captured."
+                )
+                self.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
+            # Ensure MoE forward ops are splitting ops so they are
+            # excluded from CUDA Graph capture.
+            if self.splitting_ops is None:
+                self.splitting_ops = list(self._attention_ops)
+            moe_ops = ["vllm::moe_forward", "vllm::moe_forward_shared"]
+            for op in moe_ops:
+                if op not in self.splitting_ops:
+                    self.splitting_ops.append(op)
 
     def set_splitting_ops_for_attn_fusion(self):
         assert self.pass_config.fuse_attn_quant

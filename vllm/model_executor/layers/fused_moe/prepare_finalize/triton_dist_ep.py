@@ -24,6 +24,7 @@ import torch.nn.functional as F
 import triton
 
 from triton_dist.function.nvidia.common import (
+    MoEOptimConfig,
     TritonDistEpContext,
     deinit_triton_dist_ep_op,
     get_moe_optim_config,
@@ -66,6 +67,9 @@ class TritonDistEPState:
         self._ep_ctx: TritonDistEpContext | None = None
         self._init_lock = threading.Lock()
         self._atexit_registered = False
+        # Cached per-process constants (avoid recomputing every forward)
+        self._optim_config: MoEOptimConfig | None = None
+        self._profile_config: dict | None = None
 
     def _is_runtime_initialized(self) -> bool:
         return triton_dist_ep_op_initialized(ep_implementation="mega")
@@ -175,13 +179,32 @@ class TritonDistEPState:
         top_k: int,
         num_experts: int,
     ) -> TritonDistEpContext:
-        """Get or create a TritonDistEpContext for the current forward pass."""
-        return init_triton_dist_ep_ctx(
-            ep_group=ep_group,
-            topk=top_k,
-            num_experts=num_experts,
-            ep_implementation="mega",
-        )
+        """Get or create a cached TritonDistEpContext.
+
+        The context holds 7 GPU metadata tensors (expert_ids, tile_num, etc.)
+        that are written to by build_block_row_idx_info_kernel each forward.
+        Caching avoids re-allocating these tensors every forward call.
+        """
+        if self._ep_ctx is None:
+            self._ep_ctx = init_triton_dist_ep_ctx(
+                ep_group=ep_group,
+                topk=top_k,
+                num_experts=num_experts,
+                ep_implementation="mega",
+            )
+        return self._ep_ctx
+
+    def get_optim_config(self) -> MoEOptimConfig:
+        """Cached MoE optimization config (avoids querying device props)."""
+        if self._optim_config is None:
+            self._optim_config = get_moe_optim_config(use_mega=True)
+        return self._optim_config
+
+    def get_profile_config(self) -> dict:
+        """Cached profiler config."""
+        if self._profile_config is None:
+            self._profile_config = get_triton_dist_moe_profile_enabled()
+        return self._profile_config
 
 
 # Global state - NVSHMEM should only be initialized once per process
@@ -302,8 +325,8 @@ def triton_dist_ep_forward(
     ]
 
     # --- Step 4: Build group GEMM metadata ---
-    optim_config = get_moe_optim_config(use_mega=True)
-    profile_config = get_triton_dist_moe_profile_enabled()
+    optim_config = _triton_dist_state.get_optim_config()
+    profile_config = _triton_dist_state.get_profile_config()
 
     build_block_row_idx_info_kernel[(optim_config.num_build_sms,)](
         token_splits_this_rank,
