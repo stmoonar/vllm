@@ -34,6 +34,7 @@ from triton_dist.utils import (
     nvshmem_barrier_all_on_stream,
 )
 
+from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import get_dp_group, get_ep_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -58,6 +59,35 @@ class TritonDistAll2AllManager(All2AllManagerBase):
         self._rs_ctx: ReduceScatter2DContext | None = None
         self._rs_max_M: int = 0
         self._rs_N: int = 0
+        self._local_world_size = self._resolve_local_world_size()
+
+    def _resolve_local_world_size(self) -> int:
+        """Resolve local world size from existing parallel config."""
+        if not self.internode:
+            local_world_size = self.world_size
+        else:
+            vllm_config = get_current_vllm_config_or_none()
+            if vllm_config is None:
+                raise RuntimeError(
+                    "vLLM config is not available when initializing "
+                    "triton_distributed_ag_rs."
+                )
+            local_world_size = vllm_config.parallel_config.data_parallel_size_local
+
+        if local_world_size <= 0 or self.world_size % local_world_size != 0:
+            raise RuntimeError(
+                "Invalid Triton-dist RS topology: world_size=%d, "
+                "local_world_size=%d"
+                % (self.world_size, local_world_size)
+            )
+
+        logger.info(
+            "[Rank %d/%d] Triton-dist RS topology: local_world_size=%d",
+            self.rank,
+            self.world_size,
+            local_world_size,
+        )
+        return local_world_size
 
     def _ensure_nvshmem(self):
         """Ensure NVSHMEM runtime is initialized."""
@@ -93,7 +123,7 @@ class TritonDistAll2AllManager(All2AllManagerBase):
             hidden,
         )
 
-        local_world_size = min(self.world_size, 8)
+        local_world_size = self._local_world_size
         self._rs_ctx = create_reduce_scater_2d_ctx(
             max_M=padded,
             N=hidden,
@@ -177,7 +207,7 @@ class TritonDistAll2AllManager(All2AllManagerBase):
         assert dp_metadata is not None
         sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
         assert sizes is not None
-
+        dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
         total_tokens = hidden_states.shape[0]
         hidden = hidden_states.shape[1]
 
@@ -197,7 +227,6 @@ class TritonDistAll2AllManager(All2AllManagerBase):
 
         # output shape: [padded_tokens // world_size, hidden]
         # Trim to this rank's actual token count
-        dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
         my_size = sizes[dist_group.rank_in_group]
         return output[:my_size]
 
