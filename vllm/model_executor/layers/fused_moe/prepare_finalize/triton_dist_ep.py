@@ -40,7 +40,6 @@ from triton_dist.kernels.nvidia.group_gemm import (
 )
 from triton_dist.kernels.nvidia.swiglu import swiglu_forward
 
-from vllm.config import get_current_vllm_config
 from vllm.distributed import get_ep_group
 from vllm.logger import init_logger
 
@@ -196,8 +195,11 @@ def triton_dist_ep_forward(
     # EpAll2AllFusedOp allocates NVSHMEM buffers sized [nnodes, max_tokens, topk]
     # at init time. If the actual batch exceeds this, preprocess() will crash with
     # a tensor shape mismatch.
+    #
+    # layer.vllm_config is captured at layer __init__ time (when config context
+    # is available), so it is safe to read here at forward time.
     max_tokens_per_rank = (
-        get_current_vllm_config().scheduler_config.max_num_batched_tokens
+        layer.vllm_config.scheduler_config.max_num_batched_tokens
     )
     retry_once = True
     while True:
