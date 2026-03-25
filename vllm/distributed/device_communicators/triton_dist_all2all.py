@@ -26,7 +26,8 @@ import torch
 from triton_dist.kernels.nvidia.reduce_scatter import (
     ReduceScatter2DContext,
     create_reduce_scater_2d_ctx,
-    reduce_scatter_2d_op,
+    reduce_scatter_for_each_node_ring,
+    ring_reduce,
 )
 from triton_dist.utils import (
     init_nvshmem_by_torch_process_group,
@@ -211,6 +212,10 @@ class TritonDistAll2AllManager(All2AllManagerBase):
         total_tokens = hidden_states.shape[0]
         hidden = hidden_states.shape[1]
 
+        # Triton-dist RS kernels use flat pointer arithmetic internally.
+        # Keep the input contiguous to avoid invalid address calculations.
+        hidden_states = hidden_states.contiguous()
+
         # RS requires M % world_size == 0; pad if needed
         padded_tokens = (
             math.ceil(total_tokens / self.world_size) * self.world_size
@@ -223,7 +228,32 @@ class TritonDistAll2AllManager(All2AllManagerBase):
                 hidden_states, (0, 0, 0, padded_tokens - total_tokens)
             )
 
-        output = reduce_scatter_2d_op(hidden_states, self._rs_ctx)
+        # NOTE: Force ring RS path for stability in vLLM AG/RS backend.
+        # The fullmesh path may hit CUDA_ERROR_INVALID_VALUE in _wait_eq_cuda
+        # for this workload/topology.
+        M_per_rank = hidden_states.shape[0] // self._rs_ctx.world_size
+        current_stream = torch.cuda.current_stream()
+        self._rs_ctx.reduction_stream.wait_stream(current_stream)
+        output = torch.empty(
+            (M_per_rank, hidden_states.shape[1]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        out_each_node = output if self._rs_ctx.nnodes == 1 else None
+        rs_result_per_node = reduce_scatter_for_each_node_ring(
+            hidden_states,
+            self._rs_ctx,
+            out_each_node,
+        )
+        if self._rs_ctx.nnodes > 1:
+            nvshmem_barrier_all_on_stream(current_stream)
+            ring_reduce(
+                rs_result_per_node,
+                output,
+                self._rs_ctx.node_id,
+                self._rs_ctx.nnodes,
+            )
+        self._rs_ctx.reset_barriers()
 
         # output shape: [padded_tokens // world_size, hidden]
         # Trim to this rank's actual token count
