@@ -106,6 +106,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         return self._is_monolithic
 
     @property
+    def supports_internal_mk(self) -> bool:
+        # Triton-distributed mega kernels handle EP All2All communication
+        # internally via NVSHMEM. The runner must NOT do naive AllGather/
+        # ReduceScatter dispatch/combine around the monolithic forward,
+        # otherwise tokens are duplicated (dp_size×) and the pre-allocated
+        # NVSHMEM buffers overflow.
+        if (
+            self.unquantized_backend
+            == UnquantizedMoeBackend.TRITON_DISTRIBUTED
+        ):
+            return True
+        return super().supports_internal_mk
+
+    @property
     def supports_eplb(self) -> bool:
         return True
 
