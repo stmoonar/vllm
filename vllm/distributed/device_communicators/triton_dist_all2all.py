@@ -103,6 +103,9 @@ class TritonDistAll2AllManager(All2AllManagerBase):
 
     def _ensure_rs_ctx(self, total_tokens: int, hidden: int):
         """Lazily create ReduceScatter context sized for the workload."""
+        if torch.cuda.current_device() != self.device.index:
+            torch.cuda.set_device(self.device)
+
         # Pad to multiple of world_size (RS requirement)
         padded = math.ceil(total_tokens / self.world_size) * self.world_size
 
@@ -204,6 +207,11 @@ class TritonDistAll2AllManager(All2AllManagerBase):
     def combine(
         self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
     ) -> torch.Tensor:
+        if hidden_states.device.type == "cuda":
+            expected_device = hidden_states.device
+            if torch.cuda.current_device() != expected_device.index:
+                torch.cuda.set_device(expected_device)
+
         dp_metadata = get_forward_context().dp_metadata
         assert dp_metadata is not None
         sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
