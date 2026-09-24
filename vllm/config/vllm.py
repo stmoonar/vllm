@@ -1108,6 +1108,13 @@ class VllmConfig:
             "expandable_segments is automatically disabled)."
         )
 
+    def _verify_sleep_mode_backend(self) -> None:
+        if self.model_config is None or not self.model_config.enable_sleep_mode:
+            return
+        from vllm.device_allocator.sleep_mode_backend import SleepModeBackendFactory
+
+        SleepModeBackendFactory.verify_config(self)
+
     def _verify_sampling_replay_config(self) -> None:
         model_config = self.model_config
         if model_config is None or not model_config.return_sampling_mask:
@@ -2083,6 +2090,7 @@ class VllmConfig:
                 custom_ops.append("+quant_fp8")
 
         self._verify_kv_transfer_compat()
+        self._verify_sleep_mode_backend()
         # Log the custom passes that are enabled
         self.compilation_config.pass_config.log_enabled_passes()
 

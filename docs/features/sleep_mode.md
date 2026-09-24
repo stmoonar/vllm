@@ -117,6 +117,19 @@ curl -X POST 'http://localhost:8000/wake_up?tags=kv_cache'
 !!! note
     These endpoints are only available when passing `VLLM_SERVER_DEV_MODE=1`.
 
+## Shared weight snapshots
+
+For hot-switching between models whose weights never change, pass `--sleep-mode-backend shared_weights` (together with `--enable-sleep-mode`). On the first level 1 sleep, each rank copies its weights once into a page-locked file under `VLLM_SHARED_WEIGHTS_DIR` (default `/dev/shm/vllm_shared_weights`). The file is placed on the GPU's NUMA node. After that, sleeping only unmaps GPU memory, and waking up only copies the snapshot back to the GPU.
+
+Instances on the same node that hold the same shard (same model, configuration, TP/PP rank, GPU type and NUMA node) share one snapshot instead of each keeping its own copy. Before attaching, an instance checks that every tensor reachable from its model sits at the same place and has the same checksum; otherwise it keeps a private snapshot. The last instance using a snapshot removes it when it exits normally. Snapshots left behind by crashed instances are reused, or can be deleted by hand.
+
+Requirements and restrictions:
+
+- Only level 1 sleep is supported.
+- LoRA, EPLB and weight transfer are rejected at startup, because they modify weights after loading.
+- The tmpfs must be large enough to hold the snapshots (e.g. `docker run --shm-size`). Instances in different containers share snapshots only if they see the same tmpfs (e.g. `--ipc=host` or a shared tmpfs volume).
+- NUMA placement uses `mbind`, which Docker's default seccomp profile only allows with `--cap-add SYS_NICE`. Without it, placement falls back to the kernel default and a warning is logged.
+
 ## Limitation
 
 On ROCm, the virtual memory allocation on ROCm is done through chunked memory allocation. You can control the chunk size through `VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE` (in MB). The default value is set at 256MB. The larger the chunk size the faster the performance. However, setting it too large will cause OOM. So if you encounter OOM when using sleep mode. Try reducing the chunk size. It is recommended to define the chunk size as a power of 2.

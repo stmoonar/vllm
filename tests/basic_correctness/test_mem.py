@@ -270,6 +270,33 @@ def test_end_to_end(model: str):
     assert output[0].outputs[0].text == output3[0].outputs[0].text
 
 
+@create_new_process_for_each_test("fork")
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+def test_shared_weights_backend_end_to_end(tmp_path, monkeypatch):
+    """Weights come back from the host snapshot on every wake-up, and the
+    snapshot is taken only once."""
+    monkeypatch.setenv("VLLM_SHARED_WEIGHTS_DIR", str(tmp_path))
+    llm = LLM(
+        "facebook/opt-125m",
+        enable_sleep_mode=True,
+        sleep_mode_backend="shared_weights",
+    )
+    prompt = "How are you?"
+    sampling_params = SamplingParams(temperature=0, max_tokens=10)
+    expected = llm.generate(prompt, sampling_params)[0].outputs[0].text
+
+    llm.sleep(level=1)
+    (snapshot,) = tmp_path.glob("*.bin")
+    mtime = snapshot.stat().st_mtime_ns
+    llm.wake_up()
+    assert llm.generate(prompt, sampling_params)[0].outputs[0].text == expected
+
+    llm.sleep(level=1)
+    llm.wake_up()
+    assert llm.generate(prompt, sampling_params)[0].outputs[0].text == expected
+    assert snapshot.stat().st_mtime_ns == mtime
+
+
 @create_new_process_for_each_test()
 def test_deep_sleep():
     model = "hmellor/tiny-random-LlamaForCausalLM"

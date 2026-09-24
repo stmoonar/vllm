@@ -240,6 +240,11 @@ class Worker(WorkerBase):
             self._sleep_mode_backend = SleepModeBackendFactory.create_backend(
                 self.vllm_config.model_config
             )
+            models = {"model": self.get_model(), "draft": self.get_draft_model()}
+            self._sleep_mode_backend.bind(
+                self.vllm_config,
+                {role: model for role, model in models.items() if model is not None},
+            )
         return self._sleep_mode_backend
 
     def sleep(self, level: int = 1) -> None:

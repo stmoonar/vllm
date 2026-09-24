@@ -268,6 +268,7 @@ if TYPE_CHECKING:
     VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC: bool = False
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
+    VLLM_SHARED_WEIGHTS_DIR: str = "/dev/shm/vllm_shared_weights"
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
     VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT: bool = False
     VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS: bool = False
@@ -1885,6 +1886,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_STARTUP_PLAN": lambda: bool(
         int(os.getenv("VLLM_ENABLE_STARTUP_PLAN", "0"))
     ),
+    # Directory (on a tmpfs such as /dev/shm) holding the host weight snapshots
+    # shared across instances by the `shared_weights` sleep-mode backend.
+    "VLLM_SHARED_WEIGHTS_DIR": lambda: os.getenv(
+        "VLLM_SHARED_WEIGHTS_DIR", "/dev/shm/vllm_shared_weights"
+    ),
     # Valid values are container,code_interpreter,web_search_preview
     # ex VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS=container,code_interpreter
     # If the server_label of your mcp tool is not in this list it will
@@ -2262,6 +2268,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
+        "VLLM_SHARED_WEIGHTS_DIR",
         # Runtime memory-plan persistence; does not affect compiled graphs.
         "VLLM_ENABLE_STARTUP_PLAN",
         # Location-only derived paths: where a cache/config directory lives

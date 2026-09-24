@@ -27,6 +27,9 @@ from typing import TYPE_CHECKING, Literal
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
+    from torch import nn
+
+    from vllm.config import VllmConfig
     from vllm.config.model import ModelConfig
 
 logger = init_logger(__name__)
@@ -73,12 +76,22 @@ class SleepModeBackend(ABC):
         (suspended) engine from a healthy-serving one (see RFC #34303)."""
         return self._state
 
+    def bind(self, vllm_config: VllmConfig, models: dict[str, nn.Module]) -> None:
+        """Called by the worker once the backend is created, with the loaded
+        models keyed by role (``"model"``, ``"draft"``)."""
+        return
+
     # -- Capability introspection (no instance required) --
 
     @classmethod
     def is_supported(cls) -> bool:
         """Whether this backend can run on the current platform/driver."""
         return True
+
+    @classmethod
+    def verify_config(cls, vllm_config: VllmConfig) -> None:
+        """Reject configurations this backend cannot serve, at startup."""
+        return
 
     @classmethod
     def preserves_communicators(cls) -> bool:
@@ -172,6 +185,20 @@ class SleepModeBackendFactory:
         return cls._registry[name]()
 
     @classmethod
+    def verify_config(cls, vllm_config: VllmConfig) -> None:
+        """Run the selected backend's startup checks. Names not registered yet
+        (plugins loaded later) are resolved and checked on first use."""
+        name = vllm_config.model_config.sleep_mode_backend
+        if name not in cls._registry:
+            return
+        backend_cls = cls.get_backend_class(name)
+        if not backend_cls.is_supported():
+            raise ValueError(
+                f"Sleep-mode backend '{name}' is not supported on this platform."
+            )
+        backend_cls.verify_config(vllm_config)
+
+    @classmethod
     def create_backend(cls, model_config: ModelConfig) -> SleepModeBackend:
         """Instantiate the backend selected by ``model_config``."""
         name = model_config.sleep_mode_backend
@@ -192,4 +219,9 @@ SleepModeBackendFactory.register_backend(
     "cumem",
     "vllm.device_allocator.sleep_mode_backend",
     "CuMemBackend",
+)
+SleepModeBackendFactory.register_backend(
+    "shared_weights",
+    "vllm.device_allocator.shared_weights_backend",
+    "SharedWeightsBackend",
 )
