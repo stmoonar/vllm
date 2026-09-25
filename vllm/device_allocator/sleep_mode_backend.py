@@ -27,8 +27,6 @@ from typing import TYPE_CHECKING, Literal
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
-    from torch import nn
-
     from vllm.config import VllmConfig
     from vllm.config.model import ModelConfig
 
@@ -75,11 +73,6 @@ class SleepModeBackend(ABC):
         """Current lifecycle state. Lets ``/health`` distinguish a healthy-idle
         (suspended) engine from a healthy-serving one (see RFC #34303)."""
         return self._state
-
-    def bind(self, vllm_config: VllmConfig, models: dict[str, nn.Module]) -> None:
-        """Called by the worker once the backend is created, with the loaded
-        models keyed by role (``"model"``, ``"draft"``)."""
-        return
 
     # -- Capability introspection (no instance required) --
 
@@ -221,7 +214,7 @@ SleepModeBackendFactory.register_backend(
     "CuMemBackend",
 )
 SleepModeBackendFactory.register_backend(
-    "shared_weights",
-    "vllm.device_allocator.shared_weights_backend",
-    "SharedWeightsBackend",
+    "pinned_weights",
+    "vllm.device_allocator.pinned_weights_backend",
+    "PinnedWeightsBackend",
 )

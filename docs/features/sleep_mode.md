@@ -117,18 +117,14 @@ curl -X POST 'http://localhost:8000/wake_up?tags=kv_cache'
 !!! note
     These endpoints are only available when passing `VLLM_SERVER_DEV_MODE=1`.
 
-## Shared weight snapshots
+## Pinned weight copies
 
-For hot-switching between models whose weights never change, pass `--sleep-mode-backend shared_weights` (together with `--enable-sleep-mode`). On the first level 1 sleep, each rank copies its weights once into a page-locked file under `VLLM_SHARED_WEIGHTS_DIR` (default `/dev/shm/vllm_shared_weights`). The file is placed on the GPU's NUMA node. After that, sleeping only unmaps GPU memory, and waking up only copies the snapshot back to the GPU.
+For hot-switching between models whose weights never change, pass `--sleep-mode-backend pinned_weights` (together with `--enable-sleep-mode`). On the first level 1 sleep, each rank copies its weights to pinned CPU memory, as the default backend does, but keeps that copy for the life of the process. After that, sleeping only frees GPU memory without copying, and waking up copies the kept weights back to the GPU. The pinned CPU memory stays allocated even while the engine is awake.
 
-Instances on the same node that hold the same shard (same model, configuration, TP/PP rank, GPU type and NUMA node) share one snapshot instead of each keeping its own copy. Before attaching, an instance checks that every tensor reachable from its model sits at the same place and has the same checksum; otherwise it keeps a private snapshot. The last instance using a snapshot removes it when it exits normally. Snapshots left behind by crashed instances are reused, or can be deleted by hand.
-
-Requirements and restrictions:
+Restrictions:
 
 - Only level 1 sleep is supported.
-- LoRA, EPLB and weight transfer are rejected at startup, because they modify weights after loading.
-- The tmpfs must be large enough to hold the snapshots (e.g. `docker run --shm-size`). Instances in different containers share snapshots only if they see the same tmpfs (e.g. `--ipc=host` or a shared tmpfs volume).
-- NUMA placement uses `mbind`, which Docker's default seccomp profile only allows with `--cap-add SYS_NICE`. Without it, placement falls back to the kernel default and a warning is logged.
+- LoRA, EPLB and weight transfer are rejected at startup, because they modify weights after loading and would leave the CPU copy stale.
 
 ## Limitation
 
