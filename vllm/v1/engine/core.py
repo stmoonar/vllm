@@ -1642,17 +1642,65 @@ class EngineCoreProc(EngineCore):
         logger.debug(
             "Rejecting new request %s: the scheduler is paused.", request.request_id
         )
-        output = EngineCoreOutput(
-            request.request_id,
-            [],
-            finish_reason=FinishReason.ABORT,
-            stop_reason=SLEEP_REJECTED_STOP_REASON,
-        )
-        eco = EngineCoreOutputs(
-            finished_requests={request.request_id}, outputs=[output]
-        )
-        self.output_queue.put_nowait((request.client_index, eco))
+        self._send_sleep_rejections([request.request_id], request.client_index)
         return True
+
+    def _send_sleep_rejections(self, req_ids: list[str], client_index: int) -> None:
+        """Finish requests with the abort output that the API server turns
+        into a 503 ``EngineSleeping`` response."""
+        outputs = [
+            EngineCoreOutput(
+                req_id,
+                [],
+                finish_reason=FinishReason.ABORT,
+                stop_reason=SLEEP_REJECTED_STOP_REASON,
+            )
+            for req_id in req_ids
+        ]
+        eco = EngineCoreOutputs(finished_requests=set(req_ids), outputs=outputs)
+        self.output_queue.put_nowait((client_index, eco))
+
+    def _finish_held_requests(self) -> None:
+        """With ``--sleep-reject-new``, finish the requests that a "wait"
+        pause would hold until the engine resumes.
+
+        A "wait" pause drains running requests but neither schedules nor waits
+        for waiting ones (preempted ones included), so a sleep that follows
+        would hold them for as long as the engine sleeps. Requests that have
+        not produced output are rejected like new requests (the API server
+        returns 503 and a router can retry them); requests preempted after
+        producing output are aborted (a router can continue them). Pooling
+        requests and idle streaming-input sessions are left alone.
+        """
+        held_ids = [
+            req_id
+            for req_id, req in getattr(self.scheduler, "requests", {}).items()
+            if req.pooling_params is None
+            and not req.is_finished()
+            and req.status
+            not in (RequestStatus.RUNNING, RequestStatus.WAITING_FOR_STREAMING_REQ)
+        ]
+        if not held_ids:
+            return
+        finished = self.scheduler.finish_requests(
+            held_ids, RequestStatus.FINISHED_ABORTED
+        )
+        rejected = defaultdict[int, list[str]](list)
+        aborted: list[Request] = []
+        for request in finished:
+            if request.num_output_tokens:
+                aborted.append(request)
+            else:
+                rejected[request.client_index].append(request.request_id)
+        logger.info(
+            "Pausing (wait) with --sleep-reject-new: rejected %d waiting and "
+            "aborted %d preempted requests.",
+            sum(len(ids) for ids in rejected.values()),
+            len(aborted),
+        )
+        for client_index, req_ids in rejected.items():
+            self._send_sleep_rejections(req_ids, client_index)
+        self._send_abort_outputs(aborted)
 
     def _reject_utility_in_shutdown(
         self, client_idx: int, call_id: int, method_name: str
@@ -2022,6 +2070,8 @@ class EngineCoreProc(EngineCore):
                 None, RequestStatus.FINISHED_ABORTED
             )
             self._send_abort_outputs(aborted_reqs)
+        elif mode == "wait" and self.sleep_reject_new:
+            self._finish_held_requests()
 
         pause_state = PauseState.PAUSED_ALL if mode == "keep" else PauseState.PAUSED_NEW
         self.scheduler.set_pause_state(pause_state)

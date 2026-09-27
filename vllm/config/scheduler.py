@@ -117,8 +117,11 @@ class SchedulerConfig:
     """Reject new requests with HTTP 503 (``Retry-After: 1``) while the engine
     is sleeping or its scheduler is paused, instead of queueing them until
     the engine is woken up or resumed. Requests admitted before the pause keep
-    the semantics of the pause mode (abort / wait / keep). Intended for
-    routers that retry a rejected request on another instance."""
+    the semantics of the pause mode (abort / wait / keep), except that a
+    "wait" pause, which drains only running requests, also finishes the
+    waiting ones: those without output are rejected like new requests and
+    preempted ones are aborted. Intended for routers that retry a rejected
+    request on another instance."""
 
     enable_chunked_prefill: bool = True
     """If True, prefill requests can be chunked based

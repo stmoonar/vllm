@@ -38,6 +38,7 @@ from vllm.v1.engine.core import (
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.metrics.loggers import PrometheusStatLogger
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
+from vllm.v1.request import RequestStatus
 
 
 class _Level1OnlyBackend(CuMemBackend):
@@ -342,6 +343,82 @@ def test_unpaused_engine_accepts_with_reject_new():
     core = _proc_core(reject_new=True)
     _add(core, _new_request())
     assert list(core.scheduler.requests) == ["r1"]
+
+
+class _HeldScheduler(_FakeScheduler):
+    """Scheduler stand-in holding requests in various states."""
+
+    def __init__(self, requests) -> None:
+        super().__init__()
+        self.requests = {r.request_id: r for r in requests}
+
+    def finish_requests(self, request_ids, finished_status):
+        finished = []
+        for request_id in request_ids:
+            request = self.requests.pop(request_id)
+            request.status = finished_status
+            finished.append(request)
+        return finished
+
+
+def _held(request_id, status, num_output_tokens=0, pooling=False):
+    request = SimpleNamespace(
+        request_id=request_id,
+        client_index=3,
+        status=status,
+        num_output_tokens=num_output_tokens,
+        pooling_params=object() if pooling else None,
+    )
+    request.is_finished = lambda: RequestStatus.is_finished(request.status)
+    return request
+
+
+def _held_core(reject_new: bool):
+    core = _proc_core(reject_new=reject_new)
+    core.scheduler = _HeldScheduler(
+        [
+            _held("running", RequestStatus.RUNNING, 5),
+            _held("waiting", RequestStatus.WAITING),
+            _held("preempted", RequestStatus.PREEMPTED, 7),
+            _held("preempted_in_prefill", RequestStatus.PREEMPTED),
+            _held("pooling", RequestStatus.WAITING, pooling=True),
+            _held("session", RequestStatus.WAITING_FOR_STREAMING_REQ, 3),
+        ]
+    )
+    # Idle engine: the pause completes synchronously.
+    core.engines_running = False
+    aborted: list = []
+    core._send_abort_outputs = aborted.extend
+    return core, aborted
+
+
+def test_wait_pause_finishes_held_requests_with_reject_new():
+    """A "wait" pause drains running requests only; with --sleep-reject-new
+    the waiting ones must not be held for the whole sleep."""
+    core, aborted = _held_core(reject_new=True)
+    assert core.pause_scheduler(mode="wait") is None
+    assert core.scheduler.pause_state == PauseState.PAUSED_NEW
+
+    assert set(core.scheduler.requests) == {"running", "pooling", "session"}
+    # Output already streamed: aborted, so a router can continue it.
+    assert [r.request_id for r in aborted] == ["preempted"]
+    # No output yet: rejected like a new request (503 in the API server).
+    outputs = [eco for _, eco in _drain(core.output_queue) if eco.outputs]
+    assert len(outputs) == 1
+    assert outputs[0].finished_requests == {"waiting", "preempted_in_prefill"}
+    assert {o.request_id for o in outputs[0].outputs} == outputs[0].finished_requests
+    for output in outputs[0].outputs:
+        assert output.finish_reason == FinishReason.ABORT
+        assert output.stop_reason == SLEEP_REJECTED_STOP_REASON
+
+
+@pytest.mark.parametrize("reject_new, mode", [(False, "wait"), (True, "keep")])
+def test_held_requests_kept_otherwise(reject_new, mode):
+    core, aborted = _held_core(reject_new=reject_new)
+    core.pause_scheduler(mode=mode)
+    assert len(core.scheduler.requests) == 6
+    assert aborted == []
+    assert not any(eco.outputs for _, eco in _drain(core.output_queue))
 
 
 def _published_paused_counts(core) -> list[int]:
