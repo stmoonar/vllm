@@ -4,6 +4,7 @@
 from fastapi import Request
 from starlette.responses import JSONResponse
 
+from vllm.exceptions import GracefulHTTPError
 from vllm.logger import init_logger
 
 from ..error_response import create_error_response
@@ -21,4 +22,5 @@ async def exception_handler(req: Request, exc: Exception):
         )
 
     err = create_error_response(exc)
-    return JSONResponse(err.model_dump(), status_code=err.error.code)
+    headers = exc.headers if isinstance(exc, GracefulHTTPError) else None
+    return JSONResponse(err.model_dump(), status_code=err.error.code, headers=headers)

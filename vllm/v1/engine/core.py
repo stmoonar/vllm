@@ -60,6 +60,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
+    SLEEP_REJECTED_STOP_REASON,
     EEPNotificationType,
     EngineCoreOutput,
     EngineCoreOutputs,
@@ -128,6 +129,7 @@ class EngineCore:
             )
 
         self.log_stats = log_stats
+        self.sleep_reject_new = vllm_config.scheduler_config.sleep_reject_new
         # Opaque weight version supplied by the caller.
         self._weight_version = "default"
 
@@ -1063,6 +1065,8 @@ class EngineCoreProc(EngineCore):
         identity = self.engine_index.to_bytes(length=2, byteorder="little")
         self.engines_running = False
         self.shutdown_state = EngineShutdownState.RUNNING
+        # Last num_paused_reqs published while the scheduler was paused.
+        self._last_published_num_paused = 0
 
         # Receiver for tensor IPC
         self.tensor_ipc_receiver: TensorIpcReceiver | None = None
@@ -1464,6 +1468,8 @@ class EngineCoreProc(EngineCore):
                 self._handle_client_request(*req)
             except queue.Empty:
                 break
+            # A paused engine idles here, so publish its queue from here.
+            self._maybe_publish_paused_stats()
             if not block:
                 break
 
@@ -1474,6 +1480,24 @@ class EngineCoreProc(EngineCore):
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
+        self._maybe_publish_paused_stats()
+
+    def _maybe_publish_paused_stats(self) -> None:
+        """Publish scheduler stats when the number of requests held by a
+        paused scheduler changes.
+
+        Stats are otherwise sent only with engine steps, and a paused engine
+        does not step, so requests queued during a pause would stay invisible
+        in the metrics until the engine resumes.
+        """
+        if not self.log_stats:
+            return
+        num_paused = self.scheduler.get_num_paused_requests()
+        if num_paused == self._last_published_num_paused:
+            return
+        self._last_published_num_paused = num_paused
+        if (stats := self.scheduler.make_stats()) is not None:
+            self.output_queue.put_nowait((0, EngineCoreOutputs(scheduler_stats=stats)))
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
@@ -1558,6 +1582,8 @@ class EngineCoreProc(EngineCore):
             req, request_wave = request
             if self._reject_add_in_shutdown(req):
                 return
+            if self._reject_add_while_paused(req):
+                return
             self.add_request(req, request_wave)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
@@ -1591,6 +1617,41 @@ class EngineCoreProc(EngineCore):
             request.request_id,
         )
         self._send_abort_outputs_to_client([request.request_id], request.client_index)
+        return True
+
+    def _reject_add_while_paused(self, request: Request) -> bool:
+        """With ``--sleep-reject-new``, finish a new generation request that
+        reaches a paused scheduler instead of queueing it until resume.
+
+        API servers reject requests up front while they know the engine is
+        paused; this covers requests sent before they learned of the pause,
+        e.g. by another API server process. The abort output carries
+        ``SLEEP_REJECTED_STOP_REASON`` so the API server can turn it into a
+        503 response.
+        """
+        if (
+            not self.sleep_reject_new
+            or self.scheduler.pause_state == PauseState.UNPAUSED
+            or request.pooling_params is not None
+            or request.abort_immediately
+            # Next input chunk of an existing streaming-input session.
+            or request.request_id in getattr(self.scheduler, "requests", ())
+        ):
+            return False
+
+        logger.debug(
+            "Rejecting new request %s: the scheduler is paused.", request.request_id
+        )
+        output = EngineCoreOutput(
+            request.request_id,
+            [],
+            finish_reason=FinishReason.ABORT,
+            stop_reason=SLEEP_REJECTED_STOP_REASON,
+        )
+        eco = EngineCoreOutputs(
+            finished_requests={request.request_id}, outputs=[output]
+        )
+        self.output_queue.put_nowait((request.client_index, eco))
         return True
 
     def _reject_utility_in_shutdown(

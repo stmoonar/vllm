@@ -34,6 +34,10 @@ PauseMode = Literal["abort", "wait", "keep"]
 # so form part of the external API.
 FINISH_REASON_STRINGS = ("stop", "length", "abort", "error", "repetition")
 
+# ``stop_reason`` of the abort output an engine sends for a new request it
+# rejects because its scheduler is paused and ``--sleep-reject-new`` is set.
+SLEEP_REJECTED_STOP_REASON = "engine_sleeping"
+
 EEP_NOTIFICATION_CALL_ID = -1
 
 FT_STATUS_CALL_ID = -2

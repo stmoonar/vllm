@@ -559,6 +559,7 @@ class EngineArgs:
     max_num_seqs: int | None = None
     max_num_queued_reqs: int | None = None
     max_num_queued_tokens: int | None = None
+    sleep_reject_new: bool = SchedulerConfig.sleep_reject_new
     max_logprobs: int = ModelConfig.max_logprobs
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
     use_fp64_gumbel: bool = ModelConfig.use_fp64_gumbel
@@ -1610,6 +1611,9 @@ class EngineArgs:
             **scheduler_kwargs["max_num_queued_tokens"],
         )
         scheduler_group.add_argument(
+            "--sleep-reject-new", **scheduler_kwargs["sleep_reject_new"]
+        )
+        scheduler_group.add_argument(
             "--long-prefill-token-threshold",
             **scheduler_kwargs["long_prefill_token_threshold"],
         )
@@ -2438,6 +2442,7 @@ class EngineArgs:
             max_num_seqs=self.max_num_seqs,
             max_num_queued_reqs=self.max_num_queued_reqs,
             max_num_queued_tokens=self.max_num_queued_tokens,
+            sleep_reject_new=self.sleep_reject_new,
             max_model_len=model_config.max_model_len,
             enable_chunked_prefill=self.enable_chunked_prefill,
             disable_chunked_mm_input=self.disable_chunked_mm_input,

@@ -2656,6 +2656,15 @@ class Scheduler(SchedulerInterface):
         )
         return num_waiting + len(self.running)
 
+    def get_num_paused_requests(self) -> int:
+        if self._pause_state == PauseState.UNPAUSED:
+            return 0
+        return (
+            len(self.waiting)
+            + len(self.skipped_waiting)
+            - self.num_waiting_for_streaming_input
+        )
+
     def has_finished_requests(self) -> bool:
         if self.finished_req_ids:
             return True
@@ -2785,6 +2794,7 @@ class Scheduler(SchedulerInterface):
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
+            num_paused_reqs=self.get_num_paused_requests(),
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,

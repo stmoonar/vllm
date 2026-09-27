@@ -195,6 +195,11 @@ class SchedulerInterface(ABC):
         not yet returned in SchedulerOutputs."""
         return self.has_unfinished_requests() or self.has_finished_requests()
 
+    def get_num_paused_requests(self) -> int:
+        """Number of waiting requests held back because the scheduler is
+        paused. They are scheduled once the scheduler resumes."""
+        return 0
+
     @property
     @abstractmethod
     def pause_state(self) -> PauseState:

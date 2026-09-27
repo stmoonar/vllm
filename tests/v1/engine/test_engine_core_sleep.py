@@ -5,10 +5,15 @@
 A sleep pauses the scheduler before the executor releases GPU memory. If the
 executor then fails, the engine must not stay paused while awake: it would
 report sleeping and hold every new request until a manual wake_up.
+
+Also covers ``--sleep-reject-new`` in the engine (new requests that reach a
+paused scheduler) and publishing ``vllm:num_requests_paused`` while paused.
 """
 
+import queue
 from concurrent.futures import Future
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -18,8 +23,21 @@ from vllm.device_allocator.sleep_mode_backend import (
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.v1.core.sched.interface import PauseState
-from vllm.v1.engine.core import DPEngineCoreProc, EngineCore, EngineCoreProc
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.engine import (
+    SLEEP_REJECTED_STOP_REASON,
+    EngineCoreRequestType,
+    FinishReason,
+)
+from vllm.v1.engine.core import (
+    DPEngineCoreProc,
+    EngineCore,
+    EngineCoreProc,
+    EngineShutdownState,
+)
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
+from vllm.v1.metrics.loggers import PrometheusStatLogger
+from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 
 
 class _Level1OnlyBackend(CuMemBackend):
@@ -200,3 +218,201 @@ def test_executor_stays_asleep_when_restore_fails():
     executor.collective_rpc = lambda method, kwargs=None: None
     executor.wake_up()
     assert not executor.is_sleeping
+
+
+# ---------------------------------------------------------------------------
+# --sleep-reject-new and vllm:num_requests_paused (engine side)
+# ---------------------------------------------------------------------------
+
+
+class _QueueScheduler(_FakeScheduler):
+    """Scheduler stand-in that keeps new requests in a waiting queue."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.requests: dict[str, object] = {}
+        self.waiting: list[object] = []
+
+    def add_request(self, request) -> None:
+        self.requests[request.request_id] = request
+        self.waiting.append(request)
+
+    def get_num_paused_requests(self) -> int:
+        return 0 if self.pause_state == PauseState.UNPAUSED else len(self.waiting)
+
+    def make_stats(self) -> SchedulerStats:
+        return SchedulerStats(
+            num_waiting_reqs=len(self.waiting),
+            num_paused_reqs=self.get_num_paused_requests(),
+        )
+
+
+def _proc_core(reject_new: bool, log_stats: bool = True) -> EngineCoreProc:
+    core = _engine_core(EngineCoreProc)
+    core.engines_running = False
+    core.scheduler = _QueueScheduler()
+    core.sleep_reject_new = reject_new
+    core.log_stats = log_stats
+    core.shutdown_state = EngineShutdownState.RUNNING
+    core.input_queue = queue.Queue()
+    core.output_queue = queue.Queue()
+    core.aborts_queue = queue.Queue()
+    core.process_input_queue_block = False
+    core._last_published_num_paused = 0
+    # Admission itself is not under test here.
+    core.add_request = lambda request, request_wave=0: core.scheduler.add_request(
+        request
+    )
+    return core
+
+
+def _new_request(request_id: str = "r1", **kwargs):
+    fields = dict(
+        request_id=request_id,
+        client_index=3,
+        pooling_params=None,
+        abort_immediately=False,
+    )
+    fields.update(kwargs)
+    return SimpleNamespace(**fields)
+
+
+def _add(core, request) -> None:
+    core.input_queue.put((EngineCoreRequestType.ADD, (request, 0)))
+    core._process_input_queue()
+
+
+def _drain(q: queue.Queue) -> list:
+    items = []
+    while not q.empty():
+        items.append(q.get_nowait())
+    return items
+
+
+def test_paused_engine_rejects_new_request_when_enabled():
+    core = _proc_core(reject_new=True)
+    core.scheduler.set_pause_state(PauseState.PAUSED_NEW)
+    _add(core, _new_request())
+
+    assert core.scheduler.requests == {}
+    outputs = [eco for _, eco in _drain(core.output_queue) if eco.outputs]
+    assert len(outputs) == 1
+    (output,) = outputs[0].outputs
+    assert output.request_id == "r1"
+    assert output.finish_reason == FinishReason.ABORT
+    assert output.stop_reason == SLEEP_REJECTED_STOP_REASON
+    assert outputs[0].finished_requests == {"r1"}
+
+
+@pytest.mark.parametrize("pause_state", [PauseState.PAUSED_NEW, PauseState.PAUSED_ALL])
+def test_paused_engine_queues_new_request_by_default(pause_state):
+    core = _proc_core(reject_new=False)
+    core.scheduler.set_pause_state(pause_state)
+    _add(core, _new_request())
+    assert list(core.scheduler.requests) == ["r1"]
+    assert not any(eco.outputs for _, eco in _drain(core.output_queue))
+
+
+@pytest.mark.parametrize(
+    "request_kwargs",
+    [
+        {"pooling_params": object()},
+        {"abort_immediately": True},
+    ],
+)
+def test_reject_new_skips_non_generation_adds(request_kwargs):
+    core = _proc_core(reject_new=True)
+    core.scheduler.set_pause_state(PauseState.PAUSED_NEW)
+    _add(core, _new_request(**request_kwargs))
+    assert list(core.scheduler.requests) == ["r1"]
+
+
+def test_reject_new_keeps_streaming_input_sessions():
+    """The next input chunk of a session admitted before the pause is not a
+    new request."""
+    core = _proc_core(reject_new=True)
+    _add(core, _new_request())
+    core.scheduler.set_pause_state(PauseState.PAUSED_NEW)
+    _add(core, _new_request())
+    assert len(core.scheduler.waiting) == 2
+    assert not any(eco.outputs for _, eco in _drain(core.output_queue))
+
+
+def test_unpaused_engine_accepts_with_reject_new():
+    core = _proc_core(reject_new=True)
+    _add(core, _new_request())
+    assert list(core.scheduler.requests) == ["r1"]
+
+
+def _published_paused_counts(core) -> list[int]:
+    return [
+        eco.scheduler_stats.num_paused_reqs
+        for _, eco in _drain(core.output_queue)
+        if eco.scheduler_stats is not None
+    ]
+
+
+def test_paused_queue_is_published_while_engine_idles():
+    """A paused engine does not step, so stats must be sent when requests
+    queue up behind the pause, and once more when the pause ends."""
+    core = _proc_core(reject_new=False)
+    _add(core, _new_request("a"))
+    assert _published_paused_counts(core) == []
+
+    core.scheduler.waiting.clear()
+    core.scheduler.set_pause_state(PauseState.PAUSED_NEW)
+    _add(core, _new_request("b"))
+    _add(core, _new_request("c"))
+    assert _published_paused_counts(core) == [1, 2]
+
+    # Unchanged count: nothing new to publish.
+    core._maybe_publish_paused_stats()
+    assert _published_paused_counts(core) == []
+
+    core.scheduler.set_pause_state(PauseState.UNPAUSED)
+    core._maybe_publish_paused_stats()
+    assert _published_paused_counts(core) == [0]
+
+
+def test_paused_stats_not_published_without_log_stats():
+    core = _proc_core(reject_new=False, log_stats=False)
+    core.scheduler.set_pause_state(PauseState.PAUSED_NEW)
+    _add(core, _new_request())
+    assert _published_paused_counts(core) == []
+
+
+def _real_scheduler(pause_state: PauseState, waiting: int, skipped: int = 0):
+    scheduler = object.__new__(Scheduler)
+    scheduler._pause_state = pause_state
+    scheduler.waiting = [object()] * waiting
+    scheduler.skipped_waiting = [object()] * skipped
+    scheduler.num_waiting_for_streaming_input = 0
+    return scheduler
+
+
+def test_scheduler_counts_paused_requests():
+    assert _real_scheduler(PauseState.UNPAUSED, 3).get_num_paused_requests() == 0
+    assert _real_scheduler(PauseState.PAUSED_NEW, 3, 1).get_num_paused_requests() == 4
+    assert _real_scheduler(PauseState.PAUSED_ALL, 2).get_num_paused_requests() == 2
+
+
+def test_scheduler_stats_carry_paused_requests():
+    scheduler = _real_scheduler(PauseState.PAUSED_NEW, 2)
+    scheduler.log_stats = True
+    scheduler.running = []
+    scheduler.connector_prefix_cache_stats = None
+    scheduler.kv_metrics_collector = None
+    scheduler.kv_cache_manager = SimpleNamespace(
+        make_prefix_cache_stats=PrefixCacheStats, usage=0.0
+    )
+    stats = scheduler.make_stats()
+    assert stats.num_waiting_reqs == 2
+    assert stats.num_paused_reqs == 2
+
+
+def test_prometheus_logger_exports_paused_gauge():
+    stat_logger = MagicMock(gauge_lora_info=None, kv_cache_metrics_enabled=False)
+    stats = SchedulerStats(num_waiting_reqs=3, num_paused_reqs=3)
+    PrometheusStatLogger.record(stat_logger, stats, None, engine_idx=0)
+    stat_logger.gauge_scheduler_paused[0].set.assert_called_once_with(3)
+    stat_logger.gauge_scheduler_waiting[0].set.assert_called_once_with(3)

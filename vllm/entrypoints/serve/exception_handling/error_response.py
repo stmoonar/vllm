@@ -35,7 +35,7 @@ def create_error_response(
         )
 
         if isinstance(exc, GracefulHTTPError):
-            err_type = HTTPStatus(exc.http_status).phrase
+            err_type = exc.err_type or HTTPStatus(exc.http_status).phrase
             status_code = exc.http_status
             param = None
         elif isinstance(exc, VLLMValidationError):

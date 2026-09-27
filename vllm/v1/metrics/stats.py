@@ -213,6 +213,10 @@ class SchedulerStats:
 
     perf_stats: PerfStats | None = None
 
+    # Waiting requests held back because the scheduler is paused (a subset of
+    # the waiting requests above).
+    num_paused_reqs: int = 0
+
 
 @dataclass
 class RequestStateStats:

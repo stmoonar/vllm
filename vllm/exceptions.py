@@ -136,6 +136,12 @@ class GracefulHTTPError(VLLMError):
     generic 4xx/5xx by the client/server split.
     """
 
+    err_type: str | None = None
+    """Error ``type`` in the response body; defaults to the status phrase."""
+
+    headers: dict[str, str] | None = None
+    """Extra HTTP headers sent with the error response."""
+
     def __init__(self, message: str, http_status: HTTPStatus):
         super().__init__(message)
         self.message = message
@@ -155,6 +161,25 @@ class QueueOverflowError(GracefulHTTPError):
             "Please try again later or on a different instance.",
             HTTPStatus.SERVICE_UNAVAILABLE,
         )
+
+
+class EngineSleepingError(GracefulHTTPError):
+    """Raised for a new request while the engine is sleeping or its scheduler
+    is paused and ``--sleep-reject-new`` is set.
+
+    Returns HTTP 503 with ``Retry-After`` so that a router retries the request
+    on another instance instead of letting it wait for the engine to wake up.
+    """
+
+    err_type = "EngineSleeping"
+
+    def __init__(self):
+        super().__init__(
+            "The engine is sleeping and does not accept new requests. "
+            "Please retry on a different instance.",
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+        self.headers = {"Retry-After": "1"}
 
 
 class MaxQueuedTokensError(GracefulHTTPError):

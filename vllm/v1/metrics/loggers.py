@@ -387,6 +387,9 @@ class AggregatedLoggingStatLogger(LoggingStatLogger, AggregateStatLoggerBase):
             self.last_scheduler_stats.num_skipped_waiting_reqs += (
                 last_scheduler_stats.num_skipped_waiting_reqs
             )
+            self.last_scheduler_stats.num_paused_reqs += (
+                last_scheduler_stats.num_paused_reqs
+            )
             self.last_scheduler_stats.kv_cache_usage += (
                 last_scheduler_stats.kv_cache_usage
             )
@@ -513,6 +516,20 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
         self.gauge_scheduler_waiting = create_metric_per_engine(
             gauge_scheduler_waiting, per_engine_labelvalues
+        )
+
+        gauge_scheduler_paused = self._gauge_cls(
+            name="vllm:num_requests_paused",
+            documentation=(
+                "Number of waiting requests held back because the scheduler "
+                "is paused (e.g. while the engine sleeps). Included in "
+                "vllm:num_requests_waiting."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_scheduler_paused = create_metric_per_engine(
+            gauge_scheduler_paused, per_engine_labelvalues
         )
 
         gauge_waiting_by_reason = self._gauge_cls(
@@ -1031,6 +1048,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 + scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_scheduler_waiting[engine_idx].set(total_waiting)
+            self.gauge_scheduler_paused[engine_idx].set(scheduler_stats.num_paused_reqs)
             self.gauge_waiting_by_reason[WAITING_REASON_CAPACITY][engine_idx].set(
                 scheduler_stats.num_waiting_reqs
             )
