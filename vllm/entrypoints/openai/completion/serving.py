@@ -53,6 +53,9 @@ logger = init_logger(__name__)
 
 
 class OpenAIServingCompletion(GenerateBaseServing):
+    # See --abort-return-token-ids.
+    abort_return_token_ids: bool = False
+
     def __init__(
         self,
         engine_client: EngineClient,
@@ -64,6 +67,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
         enable_prompt_tokens_details: bool = False,
         enable_force_include_usage: bool = False,
         enable_per_request_metrics: bool = False,
+        abort_return_token_ids: bool = False,
     ):
         super().__init__(
             engine_client=engine_client,
@@ -76,6 +80,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
         self.enable_per_request_metrics = enable_per_request_metrics
+        self.abort_return_token_ids = abort_return_token_ids
 
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
         mc = self.model_config
@@ -297,6 +302,12 @@ class OpenAIServingCompletion(GenerateBaseServing):
         num_prompt_tokens = [0] * num_prompts
         num_cached_tokens = None
         first_iteration = True
+        # --abort-return-token-ids: token IDs for the final abort chunk.
+        abort_ids = self.abort_return_token_ids
+        all_token_ids: list[list[int]] = (
+            [[] for _ in range(num_choices * num_prompts)] if abort_ids else []
+        )
+        all_prompt_token_ids: list[list[int] | None] = [None] * num_prompts
 
         stream_options = request.stream_options
         include_usage, include_continuous_usage = should_include_usage(
@@ -322,12 +333,16 @@ class OpenAIServingCompletion(GenerateBaseServing):
                 # Prompt details are excluded from later streamed outputs
                 if prompt_token_ids is not None:
                     num_prompt_tokens[prompt_idx] = len(prompt_token_ids)
+                    all_prompt_token_ids[prompt_idx] = as_list(prompt_token_ids)
 
                 delta_token_ids: GenericSequence[int]
                 out_logprobs: GenericSequence[dict[int, Logprob] | None] | None
 
                 for output in res.outputs:
                     i = output.index + prompt_idx * num_choices
+                    if abort_ids:
+                        all_token_ids[i].extend(output.token_ids)
+                    return_abort_ids = abort_ids and output.finish_reason == "abort"
 
                     # Useful when request.return_token_ids is True
                     # Returning prompt token IDs shares the same logic
@@ -374,6 +389,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                             not delta_text
                             and not delta_token_ids
                             and not previous_num_tokens[i]
+                            and not return_abort_ids
                         ):
                             # Chunked prefill case, don't return empty chunks
                             continue
@@ -420,6 +436,14 @@ class OpenAIServingCompletion(GenerateBaseServing):
                             )
                         ],
                     )
+                    if return_abort_ids:
+                        # Lets a router continue the request token-exactly.
+                        abort_choice = chunk.choices[0]
+                        if all_prompt_token_ids[prompt_idx] is not None:
+                            abort_choice.prompt_token_ids = all_prompt_token_ids[
+                                prompt_idx
+                            ]
+                        abort_choice.generated_token_ids = all_token_ids[i]
                     # Stamp on terminal chunk only when no trailing usage chunk
                     # will follow (that one is the true final message).
                     if (
@@ -576,6 +600,9 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     else None
                 )
 
+                return_token_ids = request.return_token_ids or (
+                    self.abort_return_token_ids and output.finish_reason == "abort"
+                )
                 choice_data = CompletionResponseChoice(
                     index=len(choices),
                     text=output_text,
@@ -583,12 +610,8 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     finish_reason=output.finish_reason,
                     stop_reason=output.stop_reason,
                     prompt_logprobs=final_res.prompt_logprobs,
-                    prompt_token_ids=(
-                        prompt_token_ids if request.return_token_ids else None
-                    ),
-                    token_ids=(
-                        as_list(output.token_ids) if request.return_token_ids else None
-                    ),
+                    prompt_token_ids=(prompt_token_ids if return_token_ids else None),
+                    token_ids=(as_list(output.token_ids) if return_token_ids else None),
                     routed_experts=routed_experts_b64,
                 )
                 choices.append(choice_data)

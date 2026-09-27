@@ -161,6 +161,9 @@ class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
     stop_reason: int | str | None = None
     # not part of the OpenAI spec but for tracing the tokens
     token_ids: list[int] | None = None
+    # All generated token IDs; only on a final abort chunk when the server
+    # runs with --abort-return-token-ids.
+    generated_token_ids: list[int] | None = None
 
 
 class ChatCompletionStreamResponse(OpenAIBaseModel):

@@ -692,6 +692,9 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
     # prompt tokens is put into choice to align with CompletionResponseChoice
     prompt_token_ids: list[int] | None = None
     token_ids: list[int] | None = None
+    # All generated token IDs; only on a final abort chunk when the server
+    # runs with --abort-return-token-ids.
+    generated_token_ids: list[int] | None = None
 
 
 class CompletionStreamResponse(OpenAIBaseModel):

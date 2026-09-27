@@ -116,6 +116,9 @@ def _make_completion_tokens_details(
 
 
 class OpenAIServingChat(GenerateBaseServing):
+    # See --abort-return-token-ids.
+    abort_return_token_ids: bool = False
+
     def __init__(
         self,
         engine_client: EngineClient,
@@ -138,6 +141,7 @@ class OpenAIServingChat(GenerateBaseServing):
         enable_log_deltas: bool = True,
         default_chat_template_kwargs: dict[str, Any] | None = None,
         enable_per_request_metrics: bool = False,
+        abort_return_token_ids: bool = False,
     ) -> None:
         super().__init__(
             engine_client=engine_client,
@@ -169,6 +173,7 @@ class OpenAIServingChat(GenerateBaseServing):
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
         self.enable_per_request_metrics = enable_per_request_metrics
+        self.abort_return_token_ids = abort_return_token_ids
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
         mc = self.model_config
         self.override_max_tokens = (
@@ -481,6 +486,12 @@ class OpenAIServingChat(GenerateBaseServing):
             tool_choice_function_name = None
 
         previous_texts = [""] * num_choices
+        # --abort-return-token-ids: token IDs for the final abort chunk.
+        abort_ids = self.abort_return_token_ids
+        all_token_ids: list[list[int]] = (
+            [[] for _ in range(num_choices)] if abort_ids else []
+        )
+        all_prompt_token_ids: list[int] | None = None
 
         try:
             if self.parser_cls is not None:
@@ -517,6 +528,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 last_res = res
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
+                    all_prompt_token_ids = as_list(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
                         num_prompt_tokens += len(res.encoder_prompt_token_ids)
 
@@ -624,6 +636,9 @@ class OpenAIServingChat(GenerateBaseServing):
                     parser = parsers[i]
                     if finish_reason_sent[i]:
                         continue
+                    if abort_ids:
+                        all_token_ids[i].extend(output.token_ids)
+                    return_abort_ids = abort_ids and output.finish_reason == "abort"
 
                     if request.logprobs and (
                         request.top_logprobs is not None or request.logprob_token_ids
@@ -646,6 +661,7 @@ class OpenAIServingChat(GenerateBaseServing):
                         not delta_text
                         and not output.token_ids
                         and not previous_num_tokens[i]
+                        and not return_abort_ids
                     ):
                         # Chunked prefill case, don't return empty chunks
                         continue
@@ -783,6 +799,11 @@ class OpenAIServingChat(GenerateBaseServing):
                         choices=[choice_data],
                         model=model_name,
                     )
+                    if return_abort_ids:
+                        # Lets a router continue the request token-exactly.
+                        chunk.choices[0].generated_token_ids = all_token_ids[i]
+                        if all_prompt_token_ids is not None:
+                            chunk.prompt_token_ids = all_prompt_token_ids
                     # Stamp the fingerprint on terminal chunks only (those with
                     # finish_reason set). When ``include_usage`` is on, the
                     # trailing usage chunk below overrides this as the true
@@ -1092,7 +1113,8 @@ class OpenAIServingChat(GenerateBaseServing):
                 stop_reason=output.stop_reason,
                 token_ids=(
                     as_list(output.token_ids)
-                    if request.return_token_ids and not suppress_metadata
+                    if (request.return_token_ids and not suppress_metadata)
+                    or (self.abort_return_token_ids and output.finish_reason == "abort")
                     else None
                 ),
                 routed_experts=routed_experts_b64,
@@ -1169,7 +1191,13 @@ class OpenAIServingChat(GenerateBaseServing):
             system_fingerprint=self.system_fingerprint,
             prompt_logprobs=clamp_prompt_logprobs(final_res.prompt_logprobs),
             prompt_token_ids=(
-                final_res.prompt_token_ids if request.return_token_ids else None
+                final_res.prompt_token_ids
+                if request.return_token_ids
+                or (
+                    self.abort_return_token_ids
+                    and any(o.finish_reason == "abort" for o in final_res.outputs)
+                )
+                else None
             ),
             prompt_text=prompt_text,
             kv_transfer_params=final_res.kv_transfer_params,

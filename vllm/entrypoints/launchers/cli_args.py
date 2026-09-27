@@ -137,6 +137,14 @@ class BaseFrontendArgs:
     """If set to True, enable tracking server_load_metrics in the app state."""
     enable_force_include_usage: bool = False
     """If set to True, including usage on every request."""
+    abort_return_token_ids: bool = False
+    """If set, a completion or chat completion that ends with
+    `finish_reason="abort"` carries its prompt token IDs and the token IDs
+    generated before the abort, so that a router can continue the request
+    on another instance without re-tokenizing. Non-streaming responses fill
+    `prompt_token_ids` and `token_ids` as with `return_token_ids`; in
+    streaming responses the final (abort) chunk gets `prompt_token_ids` and
+    `generated_token_ids` (all generated tokens)."""
     sse_keep_alive_interval: int = 0
     """Send an SSE keep-alive comment line every this many seconds when a
     `/v1/chat/completions` or `/v1/completions` streaming response is idle
