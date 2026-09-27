@@ -79,6 +79,8 @@ def test_rejects_new_requests_between_sleep_and_wake_up():
         assert client.post("/v1/probe").status_code == 200
 
         assert client.post("/sleep", params={"level": "1"}).status_code == 200
+        engine.engine_core.is_sleeping_async.return_value = True
+        _assert_rejected(client.post("/v1/probe"))
         _assert_rejected(client.post("/v1/probe"))
 
         engine.engine_core.is_sleeping_async.return_value = False
@@ -90,6 +92,7 @@ def test_level_0_sleep_also_rejects():
     engine = _engine()
     with _app(engine) as client:
         assert client.post("/sleep", params={"level": "0"}).status_code == 200
+        engine.engine_core.is_sleeping_async.return_value = True
         _assert_rejected(client.post("/v1/probe"))
 
 
@@ -143,11 +146,55 @@ def test_stale_wake_up_refresh_is_ignored():
     asyncio.run(engine.sleep(1))
 
     async def racing_is_sleeping():
-        engine._mark_engine_paused()  # a concurrent /sleep call
+        engine._pause_epoch += 1  # a concurrent /sleep call
+        engine._engine_paused = True
         return False
 
     engine.engine_core.is_sleeping_async.side_effect = racing_is_sleeping
     asyncio.run(engine.wake_up())
+    with pytest.raises(EngineSleepingError):
+        engine.check_admission(1)
+
+
+def test_stale_paused_state_is_reread_in_background():
+    """With several API server processes, another one may wake the engine
+    up. A rejected request makes this one re-read the engine state (at most
+    every 0.5 s), so it stops rejecting within about one Retry-After."""
+    engine = _engine()
+
+    async def run():
+        await engine.sleep(1)
+        is_sleeping = engine.engine_core.is_sleeping_async
+        is_sleeping.return_value = True
+        with pytest.raises(EngineSleepingError):
+            engine.check_admission(1)
+        await engine._paused_refresh_task
+        with pytest.raises(EngineSleepingError):
+            engine.check_admission(1)  # still asleep; refresh rate-limited
+        assert is_sleeping.await_count == 1
+
+        is_sleeping.return_value = False  # woken up via another API server
+        engine._last_paused_refresh = 0.0
+        with pytest.raises(EngineSleepingError):
+            engine.check_admission(1)
+        await engine._paused_refresh_task
+        engine.check_admission(1)
+
+    asyncio.run(run())
+
+
+def test_no_background_refresh_during_sleep_call():
+    """While a sleep call is in flight the engine may not be paused yet, so
+    a background re-read must not reopen admission."""
+    engine = _engine()
+
+    async def sleep_rpc(*args):
+        with pytest.raises(EngineSleepingError):
+            engine.check_admission(1)
+        assert engine._paused_refresh_task is None
+
+    engine.engine_core.sleep_async.side_effect = sleep_rpc
+    asyncio.run(engine.sleep(1))
     with pytest.raises(EngineSleepingError):
         engine.check_admission(1)
 

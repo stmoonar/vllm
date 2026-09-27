@@ -5,7 +5,8 @@ import os
 import socket
 import time
 import warnings
-from collections.abc import AsyncGenerator, Iterable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Mapping
+from contextlib import asynccontextmanager
 from copy import copy
 from typing import Any, get_args
 
@@ -86,6 +87,9 @@ class AsyncLLM(EngineClient):
     _reject_new_while_paused: bool = False
     _engine_paused: bool = False
     _pause_epoch: int = 0
+    _num_pausing: int = 0
+    _last_paused_refresh: float = 0.0
+    _paused_refresh_task: asyncio.Task | None = None
 
     def __init__(
         self,
@@ -913,7 +917,25 @@ class AsyncLLM(EngineClient):
         """Reject a new request while the engine is known to be sleeping or
         paused, if ``--sleep-reject-new`` is set."""
         if self._reject_new_while_paused and self._engine_paused:
+            self._schedule_paused_refresh()
             raise EngineSleepingError()
+
+    def _schedule_paused_refresh(self) -> None:
+        """Re-read the engine state in the background, at most every 0.5 s.
+
+        Another API server process may have woken the engine up; without this
+        its wake-up would never reach this process and it would keep
+        rejecting requests.
+        """
+        now = time.monotonic()
+        if self._num_pausing or now - self._last_paused_refresh < 0.5:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._last_paused_refresh = now
+        self._paused_refresh_task = loop.create_task(self._refresh_engine_paused())
 
     @staticmethod
     def _is_sleep_rejection(out: RequestOutput) -> bool:
@@ -923,12 +945,28 @@ class AsyncLLM(EngineClient):
             for o in out.outputs
         )
 
-    def _mark_engine_paused(self) -> None:
-        """Stop admitting new requests; call before sending a sleep or pause
-        RPC, without awaiting in between."""
+    @asynccontextmanager
+    async def _closing_admission(self) -> AsyncIterator[None]:
+        """Stop admitting new requests for a sleep or pause call.
+
+        Admission closes before the call sends its RPC, and stays closed if
+        the call succeeds. If it fails, the engine state is read again (a
+        failed sleep resumes the engine unless it is left asleep).
+        """
         if self._reject_new_while_paused:
             self._pause_epoch += 1
             self._engine_paused = True
+        self._num_pausing += 1
+        failed = False
+        try:
+            yield
+        except Exception:
+            failed = True
+            raise
+        finally:
+            self._num_pausing -= 1
+            if failed:
+                await self._refresh_engine_paused()
 
     async def _refresh_engine_paused(self) -> None:
         """Re-read the engine state after a wake-up, a resume or a failed
@@ -979,16 +1017,12 @@ class AsyncLLM(EngineClient):
                 stacklevel=2,
             )
             mode = "wait"
-        self._mark_engine_paused()
-        try:
+        async with self._closing_admission():
             if clear_cache:
                 await self.renderer.clear_mm_cache_async()
             await self.engine_core.pause_scheduler_async(
                 mode=mode, clear_cache=clear_cache
             )
-        except Exception:
-            await self._refresh_engine_paused()
-            raise
         # Small sleep to help ensure that final outputs from any in-flight requests are
         # returned prior to this method returning. These outputs come out of the engine
         # prior to the wait-for-idle completion event, but involve additional async
@@ -1147,15 +1181,10 @@ class AsyncLLM(EngineClient):
                 f"Invalid pause mode: {mode}", parameter="mode", value=mode
             )
         SleepModeBackendFactory.verify_sleep_level(self.vllm_config.model_config, level)
-        self._mark_engine_paused()
-        try:
+        async with self._closing_admission():
             if level >= 1:
                 await self.renderer.clear_mm_cache_async()
             await self.engine_core.sleep_async(level, mode)
-        except Exception:
-            # A failed sleep resumes the engine unless it is left asleep.
-            await self._refresh_engine_paused()
-            raise
 
         if self.logger_manager is not None:
             self.logger_manager.record_sleep_state(1, level)
