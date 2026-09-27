@@ -7,11 +7,12 @@ import time
 import warnings
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import copy
-from typing import Any
+from typing import Any, get_args
 
 import vllm.envs as envs
 from vllm import TokensPrompt
 from vllm.config import VllmConfig
+from vllm.device_allocator.sleep_mode_backend import SleepModeBackendFactory
 from vllm.distributed.weight_transfer.base import (
     WeightTransferInitRequest,
     WeightTransferUpdateRequest,
@@ -1071,6 +1072,13 @@ class AsyncLLM(EngineClient):
         await self.engine_core.reset_encoder_cache_async()
 
     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
+        # Validate here as well as in the engine so that a bad request is
+        # reported as a client error rather than a failed engine call.
+        if mode not in get_args(PauseMode):
+            raise VLLMValidationError(
+                f"Invalid pause mode: {mode}", parameter="mode", value=mode
+            )
+        SleepModeBackendFactory.verify_sleep_level(self.vllm_config.model_config, level)
         if level >= 1:
             await self.renderer.clear_mm_cache_async()
         await self.engine_core.sleep_async(level, mode)

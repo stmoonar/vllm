@@ -7,6 +7,8 @@ touch CUDA - the ``cumem`` suspend/resume path is exercised end-to-end on GPU
 in ``tests/basic_correctness/test_cumem.py``.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from vllm.device_allocator.sleep_mode_backend import (
@@ -139,3 +141,38 @@ class DummyBackend(SleepModeBackend):
     @classmethod
     def supports_durable_storage(cls) -> bool:
         return True
+
+
+class _Level1OnlyBackend(CuMemBackend):
+    @classmethod
+    def supported_sleep_levels(cls) -> tuple[int, ...]:
+        return (1,)
+
+
+def test_cumem_supports_levels_1_and_2():
+    assert CuMemBackend.supported_sleep_levels() == (1, 2)
+    model_config = SimpleNamespace(sleep_mode_backend="cumem")
+    for level in (0, 1, 2):
+        SleepModeBackendFactory.verify_sleep_level(model_config, level)
+
+
+@pytest.mark.parametrize("level", [2, 3])
+def test_verify_sleep_level_rejects_unsupported_level(monkeypatch, level):
+    from vllm.exceptions import VLLMValidationError
+
+    monkeypatch.setitem(
+        SleepModeBackendFactory._registry, "level1_only", lambda: _Level1OnlyBackend
+    )
+    model_config = SimpleNamespace(sleep_mode_backend="level1_only")
+    # Level 0 only pauses scheduling and never reaches the backend.
+    SleepModeBackendFactory.verify_sleep_level(model_config, 0)
+    SleepModeBackendFactory.verify_sleep_level(model_config, 1)
+    with pytest.raises(VLLMValidationError, match=f"sleep level {level}") as exc:
+        SleepModeBackendFactory.verify_sleep_level(model_config, level)
+    assert exc.value.parameter == "level"
+
+
+def test_verify_sleep_level_skips_unregistered_backend():
+    # Plugin backends registered later are checked on first use instead.
+    model_config = SimpleNamespace(sleep_mode_backend="not_registered_yet")
+    SleepModeBackendFactory.verify_sleep_level(model_config, 2)

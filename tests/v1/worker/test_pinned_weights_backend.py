@@ -114,3 +114,46 @@ def test_host_copy_taken_once_and_kept_after_wake(allocator):
         assert backend._backups[weights.data_ptr()] is backup
         backend.suspend(level=1)
     assert allocator.d2h_copies == [POOL_BYTES]
+
+
+def test_only_level_1_is_supported():
+    from vllm.exceptions import VLLMValidationError
+
+    assert PinnedWeightsBackend.supported_sleep_levels() == (1,)
+    model_config = SimpleNamespace(sleep_mode_backend="pinned_weights")
+    SleepModeBackendFactory.verify_sleep_level(model_config, 1)
+    with pytest.raises(VLLMValidationError, match="level 2"):
+        SleepModeBackendFactory.verify_sleep_level(model_config, 2)
+
+
+def test_failed_host_copy_is_not_kept(allocator, monkeypatch):
+    """A first suspend that fails part way through the host copy must leave
+    no partial copy behind, or every later suspend fails the pool check."""
+    extra = torch.randint(0, 256, (POOL_BYTES,), dtype=torch.uint8)
+    allocator.memory["weights_2"] = extra
+    allocator.pointer_to_data[extra.data_ptr()] = AllocationData(
+        (0, POOL_BYTES, extra.data_ptr(), 0), "weights"
+    )
+    copy = cumem.libcudart.cudaMemcpy
+    calls = 0
+
+    def fail_second_copy(dst: int, src: int, nbytes: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("out of pinned memory")
+        copy(dst, src, nbytes)
+
+    monkeypatch.setattr(
+        cumem, "libcudart", SimpleNamespace(cudaMemcpy=fail_second_copy)
+    )
+    backend = PinnedWeightsBackend()
+    with pytest.raises(RuntimeError, match="pinned memory"):
+        backend.suspend(level=1)
+    assert backend._backups == {}
+    assert not any(d.is_asleep for d in allocator.pointer_to_data.values())
+
+    monkeypatch.setattr(cumem, "libcudart", SimpleNamespace(cudaMemcpy=copy))
+    backend.suspend(level=1)
+    assert len(backend._backups) == 2
+    assert all(d.is_asleep for d in allocator.pointer_to_data.values())

@@ -23,6 +23,7 @@ import zmq
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.config.pooler import POOLER_CONFIG_LOG_FIELDS
+from vllm.device_allocator.sleep_mode_backend import SleepModeBackendFactory
 from vllm.distributed import (
     cleanup_dist_env_and_memory,
     stateless_destroy_torch_distributed_process_group,
@@ -889,6 +890,9 @@ class EngineCore:
                 documentation of pause_scheduler method.
         """
 
+        # Reject levels the sleep-mode backend cannot serve before pausing.
+        SleepModeBackendFactory.verify_sleep_level(self.vllm_config.model_config, level)
+
         # Pause scheduler before sleeping.
         clear_prefix_cache = level >= 1
         pause_future = self.pause_scheduler(mode=mode, clear_cache=clear_prefix_cache)
@@ -896,9 +900,8 @@ class EngineCore:
             return pause_future
 
         # Level 1+: Delegate to executor for GPU memory management
-        model_executor = self.model_executor
         if pause_future is None:
-            model_executor.sleep(level)
+            self._sleep_executor(level)
             return None
 
         future = Future[Any]()
@@ -906,13 +909,28 @@ class EngineCore:
         def pause_complete(f: Future):
             try:
                 f.result()  # propagate any exception
-                future.set_result(model_executor.sleep(level))
+                future.set_result(self._sleep_executor(level))
             except Exception as e:
                 future.set_exception(e)
 
         logger.info("Waiting for in-flight requests to complete before sleeping...")
         pause_future.add_done_callback(pause_complete)
         return future
+
+    def _sleep_executor(self, level: int) -> None:
+        try:
+            self.model_executor.sleep(level)
+        except Exception:
+            # Scheduling was paused for this sleep. If the executor ended up
+            # awake, resume it; otherwise the engine would report sleeping
+            # with its memory resident and hold new requests until wake_up.
+            if not self.model_executor.is_sleeping:
+                self._resume_after_failed_sleep()
+            raise
+
+    def _resume_after_failed_sleep(self) -> None:
+        logger.warning("Sleep failed; resuming the scheduler.")
+        self.resume_scheduler()
 
     def wake_up(self, tags: list[str] | None = None):
         """Wake up the engine from sleep.
@@ -2099,6 +2117,13 @@ class DPEngineCoreProc(EngineCoreProc):
                 self.output_queue.put_nowait(
                     (-1, EngineCoreOutputs(start_wave=self.current_wave))
                 )
+
+    def _resume_after_failed_sleep(self) -> None:
+        # Resuming is collective across DP ranks and the sleep may have failed
+        # on this rank only, so stay paused; wake_up resumes all ranks.
+        logger.warning(
+            "Sleep failed; the scheduler stays paused until wake_up is called."
+        )
 
     def resume_scheduler(self):
         if self.pending_pause or (self.engines_running and self.ignore_start_dp_wave):

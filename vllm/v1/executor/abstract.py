@@ -339,13 +339,36 @@ class Executor(ABC):
             logger.warning("Executor is already sleeping.")
             return
         time_before_sleep = time.perf_counter()
-        self.collective_rpc("sleep", kwargs=dict(level=level))
+        try:
+            self.collective_rpc("sleep", kwargs=dict(level=level))
+        except Exception:
+            self._recover_from_failed_sleep(level)
+            raise
         time_after_sleep = time.perf_counter()
         self.sleeping_tags = {"weights", "kv_cache"}
         self.is_sleeping = True
         logger.info(
             "It took %.6f seconds to fall asleep.", time_after_sleep - time_before_sleep
         )
+
+    def _recover_from_failed_sleep(self, level: int) -> None:
+        """Workers may have released part of their memory before a sleep
+        failed, so treat the executor as asleep: ``is_sleeping`` then routes
+        the engine through ``wake_up`` before it schedules again. After a
+        level-1 failure the memory is mapped back right away; level 2 may
+        have discarded weights, so it is left to the caller's wake protocol.
+        """
+        self.sleeping_tags = {"weights", "kv_cache"}
+        self.is_sleeping = True
+        if level != 1:
+            return
+        try:
+            self.wake_up()
+        except Exception:
+            logger.exception(
+                "Failed to restore GPU memory after a failed sleep; the "
+                "executor stays asleep until wake_up succeeds."
+            )
 
     def wake_up(self, tags: list[str] | None = None):
         if not self.is_sleeping:

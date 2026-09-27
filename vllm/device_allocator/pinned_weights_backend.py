@@ -42,6 +42,11 @@ class PinnedWeightsBackend(SleepModeBackend):
         return current_platform.is_cuda()
 
     @classmethod
+    def supported_sleep_levels(cls) -> tuple[int, ...]:
+        # Level 2 implies the weights will be replaced, so a kept copy is moot.
+        return (1,)
+
+    @classmethod
     def preserves_communicators(cls) -> bool:
         return True
 
@@ -99,6 +104,10 @@ class PinnedWeightsBackend(SleepModeBackend):
         if not self._backups:
             if any(data.is_asleep for data in weights.values()):
                 raise RuntimeError("Cannot back up weights that are already released.")
+            # Publish the copy only once it is complete: a failure part way
+            # (e.g. out of pinned memory) must not leave a partial copy that
+            # makes every later suspend fail the pool-changed check.
+            backups: dict[int, torch.Tensor] = {}
             for ptr, data in weights.items():
                 backup = torch.empty(
                     data.handle[1],
@@ -107,7 +116,8 @@ class PinnedWeightsBackend(SleepModeBackend):
                     pin_memory=PIN_MEMORY,
                 )
                 cumem.libcudart.cudaMemcpy(backup.data_ptr(), ptr, data.handle[1])
-                self._backups[ptr] = backup
+                backups[ptr] = backup
+            self._backups = backups
         elif weights.keys() != self._backups.keys() or any(
             data.handle[1] != self._backups[ptr].numel()
             for ptr, data in weights.items()

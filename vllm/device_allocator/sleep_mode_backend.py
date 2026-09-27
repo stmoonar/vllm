@@ -24,6 +24,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
 
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -85,6 +86,12 @@ class SleepModeBackend(ABC):
     def verify_config(cls, vllm_config: VllmConfig) -> None:
         """Reject configurations this backend cannot serve, at startup."""
         return
+
+    @classmethod
+    def supported_sleep_levels(cls) -> tuple[int, ...]:
+        """Sleep levels that ``suspend`` accepts. Level 0 only pauses
+        scheduling and never reaches the backend, so it is always allowed."""
+        return (1, 2)
 
     @classmethod
     def preserves_communicators(cls) -> bool:
@@ -190,6 +197,27 @@ class SleepModeBackendFactory:
                 f"Sleep-mode backend '{name}' is not supported on this platform."
             )
         backend_cls.verify_config(vllm_config)
+
+    @classmethod
+    def verify_sleep_level(cls, model_config: ModelConfig, level: int) -> None:
+        """Reject a sleep level the selected backend cannot serve.
+
+        Callers run this before pausing the scheduler, so a bad request fails
+        cleanly instead of leaving the engine paused with its memory resident.
+        """
+        if level < 1:
+            return
+        name = model_config.sleep_mode_backend
+        if name not in cls._registry:
+            return
+        supported = cls.get_backend_class(name).supported_sleep_levels()
+        if level not in supported:
+            raise VLLMValidationError(
+                f"Sleep-mode backend '{name}' does not support sleep level "
+                f"{level}; supported levels: {', '.join(map(str, supported))}.",
+                parameter="level",
+                value=level,
+            )
 
     @classmethod
     def create_backend(cls, model_config: ModelConfig) -> SleepModeBackend:
