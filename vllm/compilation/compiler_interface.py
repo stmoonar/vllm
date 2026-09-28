@@ -24,6 +24,27 @@ from vllm.utils.torch_utils import is_torch_equal_or_newer
 logger = init_logger(__name__)
 
 
+def release_autotune_scratch_memory() -> None:
+    """Return cached, unused device memory to the driver after a compile.
+
+    standalone_compile forces ``triton.autotune_at_compile_time``, which
+    benchmarks each generated Triton kernel on random example inputs sized
+    like its real arguments, e.g. the whole vocab x hidden embedding table
+    (~1 GiB for a 7B model). The inputs are freed right after autotuning, but
+    the caching allocator keeps their segments. Small long-lived buffers
+    allocated later (the first forward's outputs, block tables) are then
+    carved out of such a segment and pin it, so the whole segment stays
+    reserved for the life of the process. It is not in the sleep-mode pool,
+    so it also stays on the GPU while the engine sleeps. Only a cold compile
+    autotunes; loading a cached artifact does not, which made the resident
+    memory depend on whether the compile cache was warm.
+    """
+    from vllm.platforms import current_platform
+
+    if current_platform.is_cuda_alike() and torch.cuda.is_initialized():
+        torch.accelerator.empty_cache()
+
+
 class CompilerInterface:
     """
     The interface for a compiler that can be used by vLLM.
@@ -374,6 +395,7 @@ class InductorStandaloneAdaptor(CompilerInterface):
 
         with pregrad_ctx, fake_mode_ctx:
             compiled_graph = standalone_compile(graph, example_inputs, **compile_kwargs)
+        release_autotune_scratch_memory()
 
         if use_aot:
             from torch._inductor.standalone_compile import AOTCompiledArtifact
