@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import json
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -46,6 +47,85 @@ _MODEL_TYPES_WITH_INCORRECT_TOKENIZER_CLASS: set[str] = {
     "step3p7",
     "unlimited-ocr",
 }
+
+# Hub tokenizer classes that transformers>=5 rebuilds as a SentencePiece
+# (Metaspace, "▁") tokenizer, ignoring the pre_tokenizer/decoder stored in
+# tokenizer.json. Some checkpoints (e.g. DeepSeek-R1-Distill-Llama-*) declare one
+# of these classes but ship a Llama-3 style byte-level BPE tokenizer.json; loading
+# them with the declared class drops spaces on encode and leaks "Ġ"/"Ċ"
+# on decode. For such checkpoints the class is overridden to TokenizersBackend,
+# which loads tokenizer.json as-is. Genuine SentencePiece checkpoints (Llama-2)
+# have no ByteLevel component and are left untouched.
+_SENTENCEPIECE_TOKENIZER_CLASSES: set[str] = {"LlamaTokenizer", "LlamaTokenizerFast"}
+
+
+def _has_byte_level(component: object) -> bool:
+    """Whether a tokenizer.json pre_tokenizer/decoder spec contains ByteLevel."""
+    if isinstance(component, dict):
+        if component.get("type") == "ByteLevel":
+            return True
+        return any(_has_byte_level(v) for v in component.values())
+    if isinstance(component, list):
+        return any(_has_byte_level(v) for v in component)
+    return False
+
+
+def _is_sentencepiece_class_over_byte_level_bpe(
+    tokenizer_name: str | Path,
+    model_type: str | None,
+    *,
+    revision: str | None = None,
+    token: str | bool | None = None,
+    cache_dir: str | None = None,
+) -> bool:
+    """Detect a hub tokenizer_class of LlamaTokenizer(Fast) paired with a
+    byte-level BPE tokenizer.json.
+
+    Model types that transformers already routes around the hub class
+    (``MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS``, e.g. qwen2) are skipped so
+    their loading path is unchanged. Any lookup failure returns False.
+    """
+    try:
+        from transformers.models.auto import tokenization_auto
+        from transformers.utils import cached_file
+
+        if model_type in getattr(
+            tokenization_auto, "MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS", ()
+        ):
+            return False
+
+        tokenizer_config = tokenization_auto.get_tokenizer_config(
+            tokenizer_name, cache_dir=cache_dir, revision=revision, token=token
+        )
+        if tokenizer_config.get("auto_map"):
+            return False
+        if tokenizer_config.get("tokenizer_class") not in (
+            _SENTENCEPIECE_TOKENIZER_CLASSES
+        ):
+            return False
+
+        tokenizer_file = cached_file(
+            tokenizer_name,
+            "tokenizer.json",
+            cache_dir=cache_dir,
+            revision=revision,
+            token=token,
+            _raise_exceptions_for_missing_entries=False,
+            _raise_exceptions_for_connection_errors=False,
+        )
+        if tokenizer_file is None:
+            return False
+        with open(tokenizer_file, encoding="utf-8") as f:
+            spec = json.load(f)
+        return _has_byte_level(spec.get("pre_tokenizer")) or _has_byte_level(
+            spec.get("decoder")
+        )
+    except Exception:
+        logger.debug(
+            "Could not inspect tokenizer files of %s", tokenizer_name, exc_info=True
+        )
+        return False
+
 
 _VLLM_TOKENIZERS = {
     # ``cohere`` mode uses the standard cached HF tokenizer; only the
@@ -273,6 +353,7 @@ def get_tokenizer(
     # Some models have an incorrect tokenizer_class on the hub.
     # For these model types, bypass AutoTokenizer and use TokenizersBackend directly.
     model_type = getattr(config, "model_type", None) if config else None
+    byte_level_override = False
     if model_type in _MODEL_TYPES_WITH_INCORRECT_TOKENIZER_CLASS:
         from transformers.tokenization_utils_tokenizers import TokenizersBackend
 
@@ -281,6 +362,29 @@ def get_tokenizer(
             model_type,
         )
         tokenizer_cls_ = TokenizersBackend
+    elif (
+        tokenizer_cls_ is CachedHfTokenizer
+        and kwargs.get("use_fast", True) is not False
+        and _is_sentencepiece_class_over_byte_level_bpe(
+            tokenizer_name,
+            model_type,
+            revision=revision,
+            token=kwargs.get("token"),
+            cache_dir=kwargs.get("download_dir"),
+        )
+    ):
+        from transformers.tokenization_utils_tokenizers import TokenizersBackend
+
+        logger.info(
+            "Tokenizer %s declares a SentencePiece Llama tokenizer_class but its "
+            "tokenizer.json is byte-level BPE; loading it with TokenizersBackend "
+            "instead.",
+            tokenizer_name,
+        )
+        tokenizer_cls_ = TokenizersBackend
+        byte_level_override = True
+        if kwargs.get("download_dir") is not None:
+            kwargs.setdefault("cache_dir", kwargs["download_dir"])
 
     if config is not None and tokenizer_cls_ is CachedHfTokenizer:
         # AutoTokenizer otherwise reloads config.json internally. Reuse the
@@ -289,7 +393,10 @@ def get_tokenizer(
         kwargs.setdefault("config", config)
 
     tokenizer = tokenizer_cls_.from_pretrained(tokenizer_name, *args, **kwargs)
-    if model_type in _MODEL_TYPES_WITH_INCORRECT_TOKENIZER_CLASS:
+    if (
+        model_type in _MODEL_TYPES_WITH_INCORRECT_TOKENIZER_CLASS
+        or byte_level_override
+    ):
         from vllm.tokenizers.hf import get_cached_tokenizer
 
         tokenizer = get_cached_tokenizer(tokenizer)

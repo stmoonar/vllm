@@ -6,13 +6,16 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from transformers import AutoConfig
+from tokenizers import Tokenizer
+from transformers import AutoConfig, AutoTokenizer, LlamaTokenizer
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.hf import CachedHfTokenizer
 from vllm.tokenizers.registry import (
     TokenizerRegistry,
+    _has_byte_level,
+    _is_sentencepiece_class_over_byte_level_bpe,
     cached_get_tokenizer,
     cached_resolve_tokenizer_args,
     cached_tokenizer_from_config,
@@ -225,3 +228,152 @@ def test_cached_tokenizer_from_config_registers_local_config(tmp_path: Path):
         CONFIG_MAPPING._extra_content.pop("qwen3_5_moe", None)
         if registered_config is not None:
             CONFIG_MAPPING._extra_content["qwen3_5_moe"] = registered_config
+
+
+# --- Byte-level BPE checkpoints that declare a SentencePiece Llama class ---
+
+_CORPUS = [
+    "The capital of France is Paris.\nThe capital of Germany is Berlin.",
+    "def f(x):\n\treturn x  +  1  # two  spaces",
+    "caf\u00e9 na\u00efve \u4f60\u597d\u4e16\u754c \U0001f600 done",
+] * 20
+_SAMPLE = (
+    "Hello  world,\n\n  indented line.\n"
+    "\tcafé 你好 \U0001f600 x  +  1"
+)
+
+
+def _write_checkpoint(
+    path: Path,
+    *,
+    model_type: str,
+    tokenizer_class: str,
+    byte_level: bool,
+) -> Tokenizer:
+    from tokenizers import decoders, models, pre_tokenizers, trainers
+    from transformers import LlamaConfig, Qwen2Config
+
+    special = ["<s>", "</s>", "<unk>"]
+    if byte_level:
+        tok = Tokenizer(models.BPE())
+        tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        tok.decoder = decoders.ByteLevel()
+        trainer = trainers.BpeTrainer(
+            vocab_size=400,
+            special_tokens=special,
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+        )
+    else:
+        # Llama-2 style SentencePiece BPE: Metaspace + byte fallback.
+        tok = Tokenizer(models.BPE(unk_token="<unk>", byte_fallback=True))
+        tok.pre_tokenizer = pre_tokenizers.Metaspace()
+        tok.decoder = decoders.Metaspace()
+        trainer = trainers.BpeTrainer(vocab_size=400, special_tokens=special)
+    tok.train_from_iterator(_CORPUS, trainer)
+    tok.save(str(path / "tokenizer.json"))
+
+    config_cls = {"llama": LlamaConfig, "qwen2": Qwen2Config}[model_type]
+    config_cls(
+        vocab_size=tok.get_vocab_size(),
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+    ).save_pretrained(path)
+    (path / "tokenizer_config.json").write_text(
+        json.dumps(
+            {
+                "tokenizer_class": tokenizer_class,
+                "bos_token": "<s>",
+                "eos_token": "</s>",
+                "unk_token": "<unk>",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return tok
+
+
+def _load(path: Path):
+    cached_get_tokenizer.cache_clear()
+    cached_resolve_tokenizer_args.cache_clear()
+    with patch("vllm.tokenizers.registry.logger.info") as log_info:
+        tokenizer = get_tokenizer(str(path))
+    overridden = any(
+        "byte-level BPE" in str(c.args[0]) for c in log_info.call_args_list
+    )
+    return tokenizer, overridden
+
+
+def test_byte_level_llama_class_is_overridden(tmp_path: Path):
+    raw = _write_checkpoint(
+        tmp_path,
+        model_type="llama",
+        tokenizer_class="LlamaTokenizerFast",
+        byte_level=True,
+    )
+    assert _is_sentencepiece_class_over_byte_level_bpe(tmp_path, "llama")
+
+    tokenizer, overridden = _load(tmp_path)
+
+    assert overridden
+    assert not isinstance(tokenizer, LlamaTokenizer)
+    ids = raw.encode(_SAMPLE, add_special_tokens=False).ids
+    assert tokenizer.encode(_SAMPLE, add_special_tokens=False) == ids
+    assert tokenizer.decode(ids) == raw.decode(ids) == _SAMPLE
+
+
+def test_sentencepiece_llama_is_not_overridden(tmp_path: Path):
+    _write_checkpoint(
+        tmp_path,
+        model_type="llama",
+        tokenizer_class="LlamaTokenizerFast",
+        byte_level=False,
+    )
+    assert not _is_sentencepiece_class_over_byte_level_bpe(tmp_path, "llama")
+
+    tokenizer, overridden = _load(tmp_path)
+
+    assert not overridden
+    assert isinstance(tokenizer, LlamaTokenizer)
+
+
+def test_qwen2_with_llama_class_is_left_to_transformers(tmp_path: Path):
+    # DeepSeek-R1-Distill-Qwen-* declare LlamaTokenizerFast; transformers
+    # already remaps qwen2, so vLLM must not change that path.
+    _write_checkpoint(
+        tmp_path,
+        model_type="qwen2",
+        tokenizer_class="LlamaTokenizerFast",
+        byte_level=True,
+    )
+    assert not _is_sentencepiece_class_over_byte_level_bpe(tmp_path, "qwen2")
+
+    tokenizer, overridden = _load(tmp_path)
+    reference = AutoTokenizer.from_pretrained(tmp_path)
+
+    assert not overridden
+    assert type(tokenizer).__name__ == f"Cached{type(reference).__name__}"
+    assert tokenizer.encode(_SAMPLE, add_special_tokens=False) == reference.encode(
+        _SAMPLE, add_special_tokens=False
+    )
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        ({"type": "ByteLevel"}, True),
+        (
+            {
+                "type": "Sequence",
+                "pretokenizers": [{"type": "Split"}, {"type": "ByteLevel"}],
+            },
+            True,
+        ),
+        ({"type": "Metaspace", "replacement": "\u2581"}, False),
+        (None, False),
+    ],
+)
+def test_has_byte_level(spec, expected):
+    assert _has_byte_level(spec) is expected
